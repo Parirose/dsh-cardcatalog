@@ -1,0 +1,62 @@
+{
+  "name": "dsh-cardcatalog",
+  "version": "0.1.0",
+  "description": "目录卡：把用户自己维护的记忆账本投影成标题级上下文。只读、不存储、不检索。",
+  "displayName": "目录卡",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "docs",
+    "fixtures",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.1.7-rc.2 || >=0.2.0-rc.2"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check:privacy": "node ci/check-privacy.mjs",
+    "check:readonly": "node ci/check-readonly.mjs",
+    "check": "npm test && npm run check:privacy && npm run check:readonly"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": ">=3.18.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "memory",
+    "catalog",
+    "read-only"
+  ],
+  "license": "MIT"
+}

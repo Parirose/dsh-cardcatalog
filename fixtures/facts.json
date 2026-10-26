@@ -1,0 +1,23 @@
+[
+  {
+    "id": "node-not-on-path",
+    "verifiedAt": "2025-01-01T00:00:00.000Z",
+    "ttlDays": 3650,
+    "text": "SECRET_TEXT_MARKER_FACTS",
+    "description": "SECRET_DESCRIPTION_MARKER_FACTS"
+  },
+  {
+    "id": "git-portable",
+    "verifiedAt": "2025-01-01T00:00:00.000Z",
+    "ttlDays": 3650,
+    "text": "SECRET_TEXT_MARKER_FACTS",
+    "description": "SECRET_DESCRIPTION_MARKER_FACTS"
+  },
+  {
+    "id": "napcat-webui",
+    "verifiedAt": "2025-01-01T00:00:00.000Z",
+    "ttlDays": 30,
+    "text": "SECRET_TEXT_MARKER_FACTS",
+    "description": "SECRET_DESCRIPTION_MARKER_FACTS"
+  }
+]
