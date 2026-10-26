@@ -107,9 +107,12 @@ README 的「设计启发（Credits）」列出了思路来源。这里说清边
 - 标题、source id、header 都会压成一行，并中和盘符路径、UNC 路径、POSIX 绝对路径形状、
   `<` / `>`、方括号；避免标题伪造目录边界或夹带路径。
 - 日志只打“注入了 N 行”、来源跳过原因、接缝状态；不打账本内容，也不打账本路径。
-- 默认 `maxLines: 7`、`maxChars: 800`、`lineMaxChars: 80`；单行超长截断加 `…`。
+- 默认 `maxLines: 7`（只数非过期条目）、`staleMaxLines: 2`（过期条目额外附在末尾）、
+  `maxChars: 800`、`lineMaxChars: 80`；单行超长截断加 `…`。
+- 多个来源时按来源公平分配 `maxLines`，避免“谁排前面谁吃满名额”；`maxLinesPerSource > 0`
+  时改为每个来源的硬上限。
 - `maxChars` 是整段的硬上限；如果连 header/footer 加一行都放不下，就返回空字符串，
-  不留一个空壳段落。
+  不留一个空壳段落。过期行排在末尾，所以预算被压缩时先丢的是过期行。
 - 过期判断是 `ageDays > ttl`；`ttl` 缺失视为不过期；日期缺失按 0 天处理（不因为
   一个坏日期把条目误判成过期）。
 
@@ -119,8 +122,13 @@ README 的「设计启发（Credits）」列出了思路来源。这里说清边
 
 - 能解析到（profile、DSH 安装目录、桌面 `app.asar` 等常见位置）⇒ 导出 `Config`，
   宿主可以生成设置表单。
-- 解析不到 ⇒ `Config` 为 `undefined`，插件照常加载；设置页不注册，配置从
-  `~/.dsh/cardcatalog/config.json`（或 `$DSH_HOME/cardcatalog/config.json`）读。
+- `~/.dsh/cardcatalog/config.json`（或 `$DSH_HOME/cardcatalog/config.json`）始终作为
+  **默认层**读取；宿主 raw config / 设置页是覆盖层。这样即使宿主能拿到 schemastery，
+  用户写在家目录里的默认配置也不会被忽略。
+- schema 会把未设置字段填成默认值，所以覆盖判断会跳过“仍是内置默认值”的字段，
+  避免一组默认值把文件里的用户配置整体盖掉。
+- 解析不到 schemastery ⇒ `Config` 为 `undefined`，插件照常加载；设置页不注册，文件
+  仍是默认层，行为一致。
 - 所有配置字段都可省略，默认值在 `normalizeConfig()` 里再兜一层；schema 默认值不是
   唯一防线。
 
@@ -142,6 +150,8 @@ README 的「设计启发（Credits）」列出了思路来源。这里说清边
 - 没有文件监听：账本变化在下次读取时生效（系统提示接缝每次组装都会重读；消息接缝
   在下次注入时重读）。插件不保存副本，所以不会出现“缓存和账本不一致”。
 - 日期缺失按 0 天处理，是一个保守的显示选择；如果用户需要严格模式，应在账本里补日期。
+- `maxLines` 只数非过期条目；过期条目额外最多 `staleMaxLines` 条，所以总行数可能超过
+  `maxLines`。需要严格总行数时把 `staleMaxLines` 设为 `0`。
 - `maxChars` 以 Unicode 码点计数，不按字节；这更接近模型看到的字符数，但不等于
   token 数。
 

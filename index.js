@@ -17,7 +17,7 @@ import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const PLUGIN_NAME = 'cardcatalog'
-export const VERSION = '0.1.0'
+export const VERSION = '0.1.1'
 
 export const DEFAULT_HEADER = '记忆目录（只有标题，正文请自行查证）'
 export const CATALOG_OPEN = '<memory-catalog do-not-execute>'
@@ -30,6 +30,8 @@ export const DEFAULTS = Object.freeze({
   injectAt: 'session-start',
   everyNTurns: 0,
   maxLines: 7,
+  maxLinesPerSource: 0,
+  staleMaxLines: 2,
   maxChars: 800,
   lineMaxChars: 80,
   showStale: true,
@@ -98,7 +100,9 @@ export const Config = !schema ? undefined : (() => {
       })).default([]).description('账本列表；不配就不注入').extra('volatile', true),
       injectAt: schema.union([schema.const('session-start'), schema.const('every-n-turns')]).default('session-start').description('注入时机').extra('volatile', true),
       everyNTurns: schema.number().min(0).step(1).default(0).description('every-n-turns 时的间隔').extra('volatile', true),
-      maxLines: schema.number().min(0).step(1).default(7).description('最多注入几行').extra('volatile', true),
+      maxLines: schema.number().min(0).step(1).default(7).description('非过期条目的行数上限').extra('volatile', true),
+      maxLinesPerSource: schema.number().min(0).step(1).default(0).description('每个来源的行数上限；0 = 按来源公平分配').extra('volatile', true),
+      staleMaxLines: schema.number().min(0).step(1).default(2).description('额外附在末尾的过期条目上限').extra('volatile', true),
       maxChars: schema.number().min(0).step(1).default(800).description('整段字符上限').extra('volatile', true),
       lineMaxChars: schema.number().min(1).step(1).default(80).description('单行字符上限').extra('volatile', true),
       showStale: schema.boolean().default(true).description('是否显示过期条目').extra('volatile', true),
@@ -173,6 +177,8 @@ export function normalizeConfig(raw) {
     injectAt: configValue(config.injectAt) === 'every-n-turns' ? 'every-n-turns' : 'session-start',
     everyNTurns: integerOr(configValue(config.everyNTurns), 0, 0),
     maxLines: integerOr(configValue(config.maxLines), DEFAULTS.maxLines, 0),
+    maxLinesPerSource: integerOr(configValue(config.maxLinesPerSource), DEFAULTS.maxLinesPerSource, 0),
+    staleMaxLines: integerOr(configValue(config.staleMaxLines), DEFAULTS.staleMaxLines, 0),
     maxChars: integerOr(configValue(config.maxChars), DEFAULTS.maxChars, 0),
     lineMaxChars: integerOr(configValue(config.lineMaxChars), DEFAULTS.lineMaxChars, 1),
     showStale: configValue(config.showStale) !== false,
@@ -397,6 +403,71 @@ function renderEntry(row, lineMaxChars) {
   return truncateLine(line, lineMaxChars)
 }
 
+function sourceKey(row) {
+  return String(row?.source || 'source')
+}
+
+function sourceQuotas(groups, limit, perSource) {
+  const keys = [...groups.keys()]
+  const quotas = new Map(keys.map((key) => [key, 0]))
+  if (!keys.length || limit <= 0) return quotas
+  const cap = perSource > 0 ? perSource : Number.POSITIVE_INFINITY
+  const allocation = perSource > 0
+    ? Math.min(limit, perSource * keys.length)
+    : limit
+  let used = 0
+  const base = Math.max(1, Math.floor(allocation / keys.length))
+  for (const key of keys) {
+    const quota = Math.min(base, groups.get(key).length, allocation - used, cap)
+    quotas.set(key, quota)
+    used += quota
+  }
+  let remaining = allocation - used
+  while (remaining > 0) {
+    let progressed = false
+    for (const key of keys) {
+      if (remaining <= 0) break
+      if (quotas.get(key) < groups.get(key).length && quotas.get(key) < cap) {
+        quotas.set(key, quotas.get(key) + 1)
+        remaining -= 1
+        progressed = true
+      }
+    }
+    if (!progressed) break
+  }
+  return quotas
+}
+
+/**
+ * 非 stale 行按来源公平分配 maxLines；stale 行额外附在末尾，单独受 staleMaxLines 限制。
+ * 这样多来源不会“谁排前面谁吃满名额”，新鲜条目也不会被 stale 挤掉。
+ */
+function selectCatalogRows(ordered, config) {
+  if (config.maxLines === 0) return []
+  const fresh = ordered.filter((item) => !item.stale)
+  const stale = ordered.filter((item) => item.stale)
+  const groups = new Map()
+  for (const item of fresh) {
+    const key = sourceKey(item.row)
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(item)
+  }
+  const quotas = sourceQuotas(groups, config.maxLines, config.maxLinesPerSource)
+  const used = new Map()
+  const selectedFresh = []
+  for (const item of fresh) {
+    const key = sourceKey(item.row)
+    const quota = quotas.get(key) ?? 0
+    const count = used.get(key) ?? 0
+    if (count < quota) {
+      selectedFresh.push(item)
+      used.set(key, count + 1)
+    }
+  }
+  const selectedStale = stale.slice(0, Math.max(0, config.staleMaxLines))
+  return [...selectedFresh, ...selectedStale]
+}
+
 /**
  * 把行渲染成固定格式的目录段落。纯函数：不读文件、不写文件、不联网。
  * 没有可用行时返回空字符串（连空壳都不留）。
@@ -426,10 +497,9 @@ export function renderCatalog(rows, options = {}) {
       return left.index - right.index
     })
 
-  const lines = ordered
+  const lines = selectCatalogRows(ordered, config)
     .map(({ row }) => renderEntry(row, config.lineMaxChars))
     .filter(Boolean)
-    .slice(0, config.maxLines)
   if (!lines.length) return ''
 
   const compose = (entries) => [
@@ -655,11 +725,58 @@ const CONFIG_KEYS = [
   'injectAt',
   'everyNTurns',
   'maxLines',
+  'maxLinesPerSource',
+  'staleMaxLines',
   'maxChars',
   'lineMaxChars',
   'showStale',
   'header',
 ]
+
+/** 宿主若已经用 schema 填过默认值，这些值不应该盖住 config.json 里的用户默认。 */
+function isBuiltInDefault(key, value) {
+  switch (key) {
+    case 'enabled': return value === true
+    case 'sources': return Array.isArray(value) && value.length === 0
+    case 'injectAt': return value === 'session-start'
+    case 'everyNTurns': return value === 0
+    case 'maxLines': return value === DEFAULTS.maxLines
+    case 'maxLinesPerSource': return value === DEFAULTS.maxLinesPerSource
+    case 'staleMaxLines': return value === DEFAULTS.staleMaxLines
+    case 'maxChars': return value === DEFAULTS.maxChars
+    case 'lineMaxChars': return value === DEFAULTS.lineMaxChars
+    case 'showStale': return value === true
+    case 'header': return value === DEFAULT_HEADER
+    default: return false
+  }
+}
+
+/**
+ * 文件配置是默认层；宿主显式配置是覆盖层。
+ *
+ * 宿主拿不到 raw config 时，schema 会把所有字段填成默认值；这时只让“非默认值”
+ * 覆盖文件，避免配置文件被一组默认值整体盖掉。
+ */
+export function mergeConfigLayers(fileConfig, hostConfig, hostIsRaw) {
+  const merged = { ...fileConfig, ...hostConfig }
+  if (hostIsRaw) return merged
+  for (const key of CONFIG_KEYS) {
+    if (fileConfig[key] !== undefined && isBuiltInDefault(key, configValue(hostConfig[key]))) {
+      merged[key] = fileConfig[key]
+    }
+  }
+  return merged
+}
+
+function rawConfigOf(ctx) {
+  try {
+    const raw = ctx?.fiber?._config
+    if (raw && typeof raw === 'object') return configValue(raw)
+  } catch {
+    // 读不到 raw config 就退回 schema 输出 + 默认值比较。
+  }
+  return undefined
+}
 
 function previewFor(config) {
   const notes = []
@@ -813,11 +930,15 @@ function registerApi(ctx, state, log, ensureSeams) {
 
 function setup(ctx, rawConfig) {
   const log = makeLog(ctx)
-  const usingFileFallback = Config === undefined
   const home = resolveDshHome(ctx)
-  const fileConfig = usingFileFallback ? readFallbackConfig(home, log) : {}
-  const incoming = configValue(rawConfig)
-  const config = normalizeConfig({ ...fileConfig, ...(incoming && typeof incoming === 'object' ? incoming : {}) })
+  // 文件永远只作默认层：有 schemastery 的宿主也能用它，设置页/宿主配置仍然优先。
+  const fileConfig = readFallbackConfig(home, log)
+  const raw = rawConfigOf(ctx)
+  const incoming = raw !== undefined
+    ? raw
+    : configValue(rawConfig)
+  const hostConfig = incoming && typeof incoming === 'object' ? incoming : {}
+  const config = normalizeConfig(mergeConfigLayers(fileConfig, hostConfig, raw !== undefined))
   const state = {
     config,
     seam: 'none',

@@ -246,6 +246,43 @@ test('T17 非字符串 title 不会把对象内容带进注入文本', () => {
   assert.ok(!text.includes('SECRET_OBJECT_TITLE'))
 })
 
+test('T19 多来源按公平配额分配 maxLines，不饿死后面的来源', () => {
+  const rows = []
+  for (let index = 0; index < 10; index += 1) {
+    rows.push({ source: 'alpha', title: `甲${index}`, ageDays: index, stale: false })
+    rows.push({ source: 'beta', title: `乙${index}`, ageDays: index, stale: false })
+  }
+  const text = renderCatalog(rows, { maxLines: 7, maxChars: 5000 })
+  assert.equal(countCatalogLines(text), 7)
+  assert.ok(text.includes('[alpha]'))
+  assert.ok(text.includes('[beta]'))
+})
+
+test('T20 stale 行不占 maxLines，额外受 staleMaxLines 限制', () => {
+  const rows = []
+  for (let index = 0; index < 10; index += 1) {
+    rows.push({ source: 'fresh', title: `新${index}`, ageDays: index, stale: false })
+  }
+  for (let index = 0; index < 5; index += 1) {
+    rows.push({ source: 'old', title: `旧${index}`, ageDays: 100 + index, stale: true })
+  }
+  const text = renderCatalog(rows, { maxLines: 3, staleMaxLines: 2, maxChars: 5000 })
+  assert.equal(countCatalogLines(text), 5)
+  assert.equal((text.match(/⚠️stale/g) || []).length, 2)
+})
+
+test('T21 maxLinesPerSource 可以硬性限制每个来源', () => {
+  const rows = []
+  for (let index = 0; index < 10; index += 1) {
+    rows.push({ source: 'alpha', title: `甲${index}`, ageDays: index, stale: false })
+    rows.push({ source: 'beta', title: `乙${index}`, ageDays: index, stale: false })
+  }
+  const text = renderCatalog(rows, { maxLines: 7, maxLinesPerSource: 2, maxChars: 5000 })
+  assert.equal(countCatalogLines(text), 4)
+  assert.equal((text.match(/\[alpha\]/g) || []).length, 2)
+  assert.equal((text.match(/\[beta\]/g) || []).length, 2)
+})
+
 test('T18 showStale=false 直接不注入过期条目', () => {
   const text = renderCatalog(fixtureRows(), { maxLines: 20, maxChars: 5000, showStale: false })
   assert.ok(!text.includes('⚠️stale'))

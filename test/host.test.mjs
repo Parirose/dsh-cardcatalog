@@ -6,12 +6,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { apply, CATALOG_OPEN, Config } from '../index.js'
+import { apply, CATALOG_OPEN, Config, DEFAULT_HEADER, mergeConfigLayers } from '../index.js'
 
 const FIXTURES = fileURLToPath(new URL('../fixtures/', import.meta.url))
 const FACTS = join(FIXTURES, 'facts.json')
 
-function makeCtx({ systemPrompt, agents = true, webServer, settings, home = join(FIXTURES, 'home') } = {}) {
+function makeCtx({ systemPrompt, agents = true, webServer, settings, home = join(FIXTURES, 'no-home') } = {}) {
   const handlers = new Map()
   const logs = []
   const sections = []
@@ -115,6 +115,28 @@ test('宿主注入：子会话不注入', async () => {
   const agent = makeAgent('child', [], { parentSession: 'parent' })
   const decision = await runPreStep(handlers.get('agent/pre-step'), agent)
   assert.equal(decision.messages.length, 0)
+})
+
+test('config.json 是默认层：宿主显式值覆盖，schema 默认值不覆盖', () => {
+  const fileConfig = {
+    sources: [{ id: 'from-file' }],
+    maxLines: 3,
+    header: '文件标题',
+  }
+  const explicit = mergeConfigLayers(fileConfig, { sources: [{ id: 'from-host' }], maxLines: 5 }, true)
+  assert.equal(explicit.sources[0].id, 'from-host')
+  assert.equal(explicit.maxLines, 5)
+  assert.equal(explicit.header, '文件标题')
+
+  const validatedDefaults = mergeConfigLayers(fileConfig, {
+    sources: [],
+    maxLines: 7,
+    header: DEFAULT_HEADER,
+    everyNTurns: 0,
+  }, false)
+  assert.equal(validatedDefaults.sources[0].id, 'from-file')
+  assert.equal(validatedDefaults.maxLines, 3)
+  assert.equal(validatedDefaults.header, '文件标题')
 })
 
 test('没有 schemastery 时从家目录 config.json 读配置', { skip: Boolean(Config) }, async () => {
