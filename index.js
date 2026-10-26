@@ -10,9 +10,11 @@
  * 账本是用户的，插件只是投影。
  */
 
-import { readFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 export const PLUGIN_NAME = 'cardcatalog'
 export const VERSION = '0.1.0'
@@ -35,6 +37,71 @@ export const DEFAULTS = Object.freeze({
 })
 
 const DAY_MS = 24 * 60 * 60 * 1000
+
+/**
+ * schemastery 是 optional peer。宿主 profile 没有 @deepseek-ai/* 时，这里返回
+ * undefined，插件照常加载，只是没有设置面板、改为读取家目录里的 config.json。
+ * 绝不因为一个 UI 依赖让整条插件不激活。
+ */
+async function loadSchemastery() {
+  const candidates = ['@deepseek-ai/schemastery']
+  const add = (file) => {
+    if (file && existsSync(file)) candidates.push(pathToFileURL(file).href)
+  }
+  try {
+    const { createRequire } = await import('node:module')
+    add(createRequire(import.meta.url).resolve('@deepseek-ai/schemastery'))
+    if (process.argv[1]) add(createRequire(process.argv[1]).resolve('@deepseek-ai/schemastery'))
+  } catch {
+    // 解析不到是预期路径之一，继续试宿主安装位置。
+  }
+  const hostRoots = []
+  if (process.argv[1]) hostRoots.push(resolve(dirname(process.argv[1]), '..'))
+  hostRoots.push(resolve(dirname(process.execPath), '..'))
+  if (process.resourcesPath) hostRoots.push(process.resourcesPath)
+  for (const root of hostRoots) {
+    add(join(root, 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.mjs'))
+    add(join(root, 'app.asar', 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.mjs'))
+  }
+  for (const specifier of candidates) {
+    try {
+      const module = await import(specifier)
+      const schema = module.default ?? module
+      if (typeof schema === 'function' && typeof schema.object === 'function') return schema
+    } catch {
+      // 下一个候选。
+    }
+  }
+  return undefined
+}
+
+const schema = await loadSchemastery()
+
+/**
+ * 配置 schema 全部 optional、默认空。每个字段都标 volatile：宿主的设置页
+ * 只接受 volatile 字段的写入。
+ */
+export const Config = schema ? schema.object({
+  enabled: schema.boolean().default(true).description('总开关').extra('volatile', true),
+  sources: schema.array(schema.object({
+    id: schema.string().default('').description('给人看的来源名'),
+    kind: schema.union([schema.const('facts'), schema.const('jsonl')]).default('facts').description('账本格式'),
+    path: schema.string().default('').description('账本路径，支持 ~ 与环境变量；没有默认值'),
+    idField: schema.string().default('').description('条目 id 字段'),
+    titleField: schema.string().default('').description('标题字段'),
+    dateField: schema.string().default('').description('日期字段'),
+    ttlField: schema.string().default('').description('过期天数字段'),
+    staleAfterDays: schema.number().min(0).description('覆盖 ttlField 的固定过期天数'),
+    enabled: schema.boolean().default(true).description('这个来源是否启用'),
+  })).default([]).description('账本列表；不配就不注入').extra('volatile', true),
+  injectAt: schema.union([schema.const('session-start'), schema.const('every-n-turns')]).default('session-start').description('注入时机').extra('volatile', true),
+  everyNTurns: schema.number().min(0).step(1).default(0).description('every-n-turns 时的间隔').extra('volatile', true),
+  maxLines: schema.number().min(0).step(1).default(7).description('最多注入几行').extra('volatile', true),
+  maxChars: schema.number().min(0).step(1).default(800).description('整段字符上限').extra('volatile', true),
+  lineMaxChars: schema.number().min(1).step(1).default(80).description('单行字符上限').extra('volatile', true),
+  showStale: schema.boolean().default(true).description('是否显示过期条目').extra('volatile', true),
+  header: schema.string().default(DEFAULT_HEADER).description('目录标题行').extra('volatile', true),
+}) : undefined
 
 /** 一行一条的 source 配置，补上按 kind 决定的默认字段名。 */
 function normalizeSource(raw, index) {
@@ -70,6 +137,18 @@ function integerOr(value, fallback, minimum) {
   return Math.max(minimum, Math.trunc(n))
 }
 
+/** 宿主把 volatile 字段包成 { get() }；这里只拆一层，普通对象原样返回。 */
+function configValue(value) {
+  if (value && typeof value === 'object' && typeof value.get === 'function') {
+    try {
+      return value.get()
+    } catch {
+      return undefined
+    }
+  }
+  return value
+}
+
 /**
  * 把宿主传入的配置补全成内部形状。所有字段都可省略；没有默认路径。
  * @param {unknown} raw
@@ -77,19 +156,20 @@ function integerOr(value, fallback, minimum) {
  */
 export function normalizeConfig(raw) {
   const config = raw && typeof raw === 'object' ? raw : {}
-  const sources = Array.isArray(config.sources)
-    ? config.sources.map((source, index) => normalizeSource(source, index))
+  const sourcesRaw = configValue(config.sources)
+  const sources = Array.isArray(sourcesRaw)
+    ? sourcesRaw.map((source, index) => normalizeSource(source, index))
     : []
-  const header = oneLine(config.header)
+  const header = oneLine(configValue(config.header))
   return {
-    enabled: config.enabled !== false,
+    enabled: configValue(config.enabled) !== false,
     sources,
-    injectAt: config.injectAt === 'every-n-turns' ? 'every-n-turns' : 'session-start',
-    everyNTurns: integerOr(config.everyNTurns, 0, 0),
-    maxLines: integerOr(config.maxLines, DEFAULTS.maxLines, 0),
-    maxChars: integerOr(config.maxChars, DEFAULTS.maxChars, 0),
-    lineMaxChars: integerOr(config.lineMaxChars, DEFAULTS.lineMaxChars, 1),
-    showStale: config.showStale !== false,
+    injectAt: configValue(config.injectAt) === 'every-n-turns' ? 'every-n-turns' : 'session-start',
+    everyNTurns: integerOr(configValue(config.everyNTurns), 0, 0),
+    maxLines: integerOr(configValue(config.maxLines), DEFAULTS.maxLines, 0),
+    maxChars: integerOr(configValue(config.maxChars), DEFAULTS.maxChars, 0),
+    lineMaxChars: integerOr(configValue(config.lineMaxChars), DEFAULTS.lineMaxChars, 1),
+    showStale: configValue(config.showStale) !== false,
     header: header || DEFAULT_HEADER,
   }
 }
@@ -374,4 +454,266 @@ export function countCatalogLines(text) {
     .split('\n')
     .filter((line) => line.startsWith('[') || line.startsWith('⚠️stale '))
     .length
+}
+
+/* ------------------------------------------------------------------ *
+ * 宿主半：只读配置 + 注入接缝
+ * ------------------------------------------------------------------ */
+
+export const name = PLUGIN_NAME
+
+function getService(ctx, serviceName) {
+  try {
+    if (typeof ctx?.get === 'function') return ctx.get(serviceName)
+  } catch {
+    // 服务不存在是正常降级路径。
+  }
+  return undefined
+}
+
+function makeLog(ctx) {
+  let logger
+  try {
+    logger = typeof ctx?.logger === 'function' ? ctx.logger(PLUGIN_NAME) : ctx?.logger
+  } catch {
+    logger = undefined
+  }
+  const seen = new Set()
+  return (message) => {
+    if (typeof message !== 'string' || message === '') return
+    if (message.startsWith('cardcatalog：source ')) {
+      if (seen.has(message)) return
+      seen.add(message)
+    }
+    try {
+      if (logger && typeof logger.info === 'function') {
+        logger.info(message)
+        return
+      }
+    } catch {
+      // 没有 logger 就退回 console。
+    }
+    try {
+      console.log(`[cardcatalog] ${message}`)
+    } catch {
+      // 连 console 都没有也不能影响宿主。
+    }
+  }
+}
+
+function resolveDshHome(ctx) {
+  try {
+    const service = ctx?.get?.('dshHomePath')
+    if (typeof service === 'function') {
+      const direct = service()
+      if (typeof direct === 'string' && direct) return direct
+      const joined = service('')
+      if (typeof joined === 'string' && joined) return joined
+    } else if (typeof service === 'string' && service) {
+      return service
+    }
+  } catch {
+    // 宿主没有这个服务时用环境变量/默认家目录。
+  }
+  const configured = typeof process.env.DSH_HOME === 'string' ? process.env.DSH_HOME.trim() : ''
+  return configured || join(homedir(), '.dsh')
+}
+
+function readFallbackConfig(home, log) {
+  const file = join(home, PLUGIN_NAME, 'config.json')
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed
+    log('cardcatalog：config.json 不是对象，按空配置处理')
+  } catch (error) {
+    if (error && error.code !== 'ENOENT') {
+      log('cardcatalog：config.json 读不了，按空配置处理')
+    }
+  }
+  return {}
+}
+
+function isChildAgent(agent) {
+  try {
+    const meta = agent?.session?.meta
+    return Boolean(meta && (meta.parentSession || meta.origin === 'subagent' || (meta.delegationDepth ?? 0) > 0))
+  } catch {
+    return true
+  }
+}
+
+function sessionIdOf(agent) {
+  try {
+    if (agent?.id) return String(agent.id)
+    if (agent?.session?.id) return String(agent.session.id)
+  } catch {
+    // 没有 id 就用固定键；同一进程里最多退化成一个注入槽。
+  }
+  return 'unknown-session'
+}
+
+function sessionHasCatalog(agent) {
+  try {
+    const events = agent?.session?.snapshotEvents?.()
+    if (!Array.isArray(events)) return false
+    for (const event of events) {
+      if (event?.type !== 'user/message') continue
+      if (event.data?.source?.kind === PLUGIN_NAME) return true
+      if (Array.isArray(event.data?.content)) {
+        if (event.data.content.some((block) => typeof block?.text === 'string' && block.text.includes(CATALOG_OPEN))) {
+          return true
+        }
+      }
+    }
+  } catch {
+    // 读不到会话历史时宁可不重复注入，交给下一次进程启动。
+    return true
+  }
+  return false
+}
+
+function makeCatalogMessage(text) {
+  return Object.freeze({
+    id: randomUUID(),
+    role: 'user',
+    content: Object.freeze([Object.freeze({ type: 'text', text })]),
+    source: Object.freeze({ kind: PLUGIN_NAME, form: 'catalog' }),
+  })
+}
+
+function installSystemPromptSeam(ctx, getText) {
+  const systemPrompt = getService(ctx, 'systemPrompt')
+  if (!systemPrompt || typeof systemPrompt.section !== 'function') return false
+  try {
+    systemPrompt.section({
+      name: PLUGIN_NAME,
+      order: 8500,
+      text: getText,
+      interpolate: false,
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+function installPreStepSeam(ctx, getText, state, log) {
+  if (typeof ctx?.on !== 'function') return false
+  if (!getService(ctx, 'agents')) return false
+  const lastInjectedTurn = new Map()
+  try {
+    ctx.on('agent/pre-step', async (payload, next) => {
+      const decision = await next()
+      try {
+        if (!decision || decision.kind !== 'enter') return decision
+        if (!payload || payload.step !== 1) return decision
+        const agent = payload.agent
+        if (!agent || isChildAgent(agent)) return decision
+        const turn = Number(payload.turn)
+        if (!Number.isFinite(turn) || turn < 1) return decision
+        const id = sessionIdOf(agent)
+        const already = sessionHasCatalog(agent)
+        if (already) {
+          if (state.config.injectAt !== 'every-n-turns' || state.config.everyNTurns <= 0) return decision
+          const last = lastInjectedTurn.get(id)
+          if (last !== undefined && turn - last < state.config.everyNTurns) return decision
+        }
+        const text = getText()
+        if (!text) return decision
+        lastInjectedTurn.set(id, turn)
+        return {
+          ...decision,
+          messages: [...(Array.isArray(decision.messages) ? decision.messages : []), makeCatalogMessage(text)],
+        }
+      } catch (error) {
+        log(`cardcatalog：注入失败（${error?.name || 'Error'}），本轮跳过`)
+        return decision
+      }
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+function setup(ctx, rawConfig) {
+  const log = makeLog(ctx)
+  const usingFileFallback = Config === undefined
+  const home = resolveDshHome(ctx)
+  const fileConfig = usingFileFallback ? readFallbackConfig(home, log) : {}
+  const incoming = configValue(rawConfig)
+  const config = normalizeConfig({ ...fileConfig, ...(incoming && typeof incoming === 'object' ? incoming : {}) })
+  const state = {
+    config,
+    seam: 'none',
+    loggedInjection: false,
+    loggedEmpty: false,
+    loggedError: false,
+  }
+
+  if (!config.enabled) {
+    log('cardcatalog：已停用，未注入任何记忆')
+    return
+  }
+  if (!config.sources.length) {
+    log('cardcatalog：没配 sources，未注入任何记忆')
+    return
+  }
+  if (!config.sources.some((source) => source.enabled)) {
+    log('cardcatalog：sources 全部停用，未注入任何记忆')
+    return
+  }
+
+  const getText = () => {
+    try {
+      const rows = collectCatalog(state.config, { log })
+      const text = renderCatalog(rows, state.config)
+      if (!text) {
+        if (!state.loggedEmpty) {
+          state.loggedEmpty = true
+          log('cardcatalog：没有可注入的条目，未注入')
+        }
+        return ''
+      }
+      if (!state.loggedInjection) {
+        state.loggedInjection = true
+        log(`cardcatalog：注入了 ${countCatalogLines(text)} 行`)
+      }
+      return text
+    } catch (error) {
+      if (!state.loggedError) {
+        state.loggedError = true
+        log(`cardcatalog：渲染失败（${error?.name || 'Error'}），未注入`)
+      }
+      return ''
+    }
+  }
+
+  if (installSystemPromptSeam(ctx, getText)) {
+    state.seam = 'system-prompt'
+    return
+  }
+  if (installPreStepSeam(ctx, getText, state, log)) {
+    state.seam = 'message'
+    return
+  }
+  state.seam = 'none'
+  log('cardcatalog：当前宿主没有可用的注入接缝，未注入任何记忆')
+}
+
+/**
+ * Cordis 插件入口。整个注入流程包在 try/catch 里：任何意外只记日志，
+ * 绝不影响宿主启动。
+ */
+export function apply(ctx, rawConfig) {
+  try {
+    setup(ctx, rawConfig)
+  } catch (error) {
+    try {
+      const log = makeLog(ctx)
+      log(`cardcatalog：初始化失败（${error?.name || 'Error'}），未注入任何记忆`)
+    } catch {
+      // 初始化失败也不向宿主抛。
+    }
+  }
 }
