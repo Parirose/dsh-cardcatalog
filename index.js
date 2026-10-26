@@ -17,7 +17,7 @@ import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const PLUGIN_NAME = 'cardcatalog'
-export const VERSION = '0.1.1'
+export const VERSION = '0.1.2'
 
 export const DEFAULT_HEADER = '记忆目录（只有标题，正文请自行查证）'
 export const CATALOG_OPEN = '<memory-catalog do-not-execute>'
@@ -563,6 +563,7 @@ function makeLog(ctx) {
     }
     const mustBeVisible = message === 'cardcatalog：没配 sources，未注入任何记忆'
       || message === 'cardcatalog：当前宿主没有可用的注入接缝，未注入任何记忆'
+      || message === 'cardcatalog：本会话已有目录，跳过注入'
     try {
       if (logger && typeof logger[mustBeVisible ? 'warn' : 'info'] === 'function') {
         logger[mustBeVisible ? 'warn' : 'info'](message)
@@ -640,12 +641,8 @@ function sessionHasCatalog(agent) {
     if (!Array.isArray(events)) return false
     for (const event of events) {
       if (event?.type !== 'user/message') continue
+      // 只认插件自己写入的 source.kind。正文里出现目录标记不算——用户可能只是在贴文档。
       if (event.data?.source?.kind === PLUGIN_NAME) return true
-      if (Array.isArray(event.data?.content)) {
-        if (event.data.content.some((block) => typeof block?.text === 'string' && block.text.includes(CATALOG_OPEN))) {
-          return true
-        }
-      }
     }
   } catch {
     // 读不到会话历史时宁可不重复注入，交给下一次进程启动。
@@ -697,7 +694,13 @@ function installPreStepSeam(ctx, getText, state, log) {
         const id = sessionIdOf(agent)
         const already = sessionHasCatalog(agent)
         if (already) {
-          if (state.config.injectAt !== 'every-n-turns' || state.config.everyNTurns <= 0) return decision
+          if (state.config.injectAt !== 'every-n-turns' || state.config.everyNTurns <= 0) {
+            if (!state.loggedAlready.has(id)) {
+              state.loggedAlready.add(id)
+              log('cardcatalog：本会话已有目录，跳过注入')
+            }
+            return decision
+          }
           const last = lastInjectedTurn.get(id)
           if (last !== undefined && turn - last < state.config.everyNTurns) return decision
         }
@@ -898,6 +901,7 @@ function registerApi(ctx, state, log, ensureSeams) {
         return sendJson(res, 500, { ok: false, error: 'settings-write-failed' })
       }
       state.config = next
+      state.loggedAlready.clear()
       state.loggedInjection = false
       state.loggedEmpty = false
       state.loggedError = false
@@ -943,6 +947,7 @@ function setup(ctx, rawConfig) {
     config,
     seam: 'none',
     apiRegistered: false,
+    loggedAlready: new Set(),
     loggedInjection: false,
     loggedEmpty: false,
     loggedError: false,

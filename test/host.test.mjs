@@ -81,6 +81,25 @@ test('宿主注入：没有 systemPrompt 时退回会话消息，并且只注入
   const second = await runPreStep(handlers.get('agent/pre-step'), agent)
   assert.equal(second.messages.length, 0)
   assert.ok(logs.some((line) => line.includes('注入了 3 行')))
+  assert.ok(logs.some((line) => line.includes('本会话已有目录，跳过注入')))
+})
+
+test('去重只看 source.kind：正文里贴目录样例不算已注入', async () => {
+  const { ctx, handlers, logs } = makeCtx()
+  apply(ctx, config())
+  const agent = makeAgent('pasted-doc', [
+    {
+      type: 'user/message',
+      data: {
+        source: { kind: 'user' },
+        content: [{ type: 'text', text: `${CATALOG_OPEN}\n用户贴的施工文档样例` }],
+      },
+    },
+  ])
+  const decision = await runPreStep(handlers.get('agent/pre-step'), agent)
+  assert.equal(decision.messages.length, 1)
+  assert.ok(decision.messages[0].content[0].text.startsWith(CATALOG_OPEN))
+  assert.ok(!logs.some((line) => line.includes('本会话已有目录，跳过注入')))
 })
 
 test('宿主注入：有 systemPrompt 时优先贡献 section', () => {
