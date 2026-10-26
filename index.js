@@ -81,27 +81,33 @@ const schema = await loadSchemastery()
  * 配置 schema 全部 optional、默认空。每个字段都标 volatile：宿主的设置页
  * 只接受 volatile 字段的写入。
  */
-export const Config = schema ? schema.object({
-  enabled: schema.boolean().default(true).description('总开关').extra('volatile', true),
-  sources: schema.array(schema.object({
-    id: schema.string().default('').description('给人看的来源名'),
-    kind: schema.union([schema.const('facts'), schema.const('jsonl')]).default('facts').description('账本格式'),
-    path: schema.string().default('').description('账本路径，支持 ~ 与环境变量；没有默认值'),
-    idField: schema.string().default('').description('条目 id 字段'),
-    titleField: schema.string().default('').description('标题字段'),
-    dateField: schema.string().default('').description('日期字段'),
-    ttlField: schema.string().default('').description('过期天数字段'),
-    staleAfterDays: schema.number().min(0).description('覆盖 ttlField 的固定过期天数'),
-    enabled: schema.boolean().default(true).description('这个来源是否启用'),
-  })).default([]).description('账本列表；不配就不注入').extra('volatile', true),
-  injectAt: schema.union([schema.const('session-start'), schema.const('every-n-turns')]).default('session-start').description('注入时机').extra('volatile', true),
-  everyNTurns: schema.number().min(0).step(1).default(0).description('every-n-turns 时的间隔').extra('volatile', true),
-  maxLines: schema.number().min(0).step(1).default(7).description('最多注入几行').extra('volatile', true),
-  maxChars: schema.number().min(0).step(1).default(800).description('整段字符上限').extra('volatile', true),
-  lineMaxChars: schema.number().min(1).step(1).default(80).description('单行字符上限').extra('volatile', true),
-  showStale: schema.boolean().default(true).description('是否显示过期条目').extra('volatile', true),
-  header: schema.string().default(DEFAULT_HEADER).description('目录标题行').extra('volatile', true),
-}) : undefined
+export const Config = !schema ? undefined : (() => {
+  try {
+    return schema.object({
+      enabled: schema.boolean().default(true).description('总开关').extra('volatile', true),
+      sources: schema.array(schema.object({
+        id: schema.string().default('').description('给人看的来源名'),
+        kind: schema.union([schema.const('facts'), schema.const('jsonl')]).default('facts').description('账本格式'),
+        path: schema.string().default('').description('账本路径，支持 ~ 与环境变量；没有默认值'),
+        idField: schema.string().default('').description('条目 id 字段'),
+        titleField: schema.string().default('').description('标题字段'),
+        dateField: schema.string().default('').description('日期字段'),
+        ttlField: schema.string().default('').description('过期天数字段'),
+        staleAfterDays: schema.number().min(0).description('覆盖 ttlField 的固定过期天数'),
+        enabled: schema.boolean().default(true).description('这个来源是否启用'),
+      })).default([]).description('账本列表；不配就不注入').extra('volatile', true),
+      injectAt: schema.union([schema.const('session-start'), schema.const('every-n-turns')]).default('session-start').description('注入时机').extra('volatile', true),
+      everyNTurns: schema.number().min(0).step(1).default(0).description('every-n-turns 时的间隔').extra('volatile', true),
+      maxLines: schema.number().min(0).step(1).default(7).description('最多注入几行').extra('volatile', true),
+      maxChars: schema.number().min(0).step(1).default(800).description('整段字符上限').extra('volatile', true),
+      lineMaxChars: schema.number().min(1).step(1).default(80).description('单行字符上限').extra('volatile', true),
+      showStale: schema.boolean().default(true).description('是否显示过期条目').extra('volatile', true),
+      header: schema.string().default(DEFAULT_HEADER).description('目录标题行').extra('volatile', true),
+    })
+  } catch {
+    return undefined
+  }
+})()
 
 /** 一行一条的 source 配置，补上按 kind 决定的默认字段名。 */
 function normalizeSource(raw, index) {
@@ -220,10 +226,10 @@ function scrubPathLike(value) {
 }
 
 function sanitizeTitle(value, fallback) {
-  const candidate = value === undefined || value === null ? '' : String(value)
+  const candidate = typeof value === 'string' || typeof value === 'number' ? String(value) : ''
   const cleaned = scrubPathLike(candidate)
   if (cleaned) return cleaned
-  const backup = fallback === undefined || fallback === null ? '' : scrubPathLike(String(fallback))
+  const backup = typeof fallback === 'string' || typeof fallback === 'number' ? scrubPathLike(String(fallback)) : ''
   return backup || '<no-title>'
 }
 
@@ -485,18 +491,24 @@ function makeLog(ctx) {
       if (seen.has(message)) return
       seen.add(message)
     }
+    const mustBeVisible = message === 'cardcatalog：没配 sources，未注入任何记忆'
+      || message === 'cardcatalog：当前宿主没有可用的注入接缝，未注入任何记忆'
     try {
-      if (logger && typeof logger.info === 'function') {
+      if (logger && typeof logger[mustBeVisible ? 'warn' : 'info'] === 'function') {
+        logger[mustBeVisible ? 'warn' : 'info'](message)
+      } else if (logger && typeof logger.info === 'function') {
         logger.info(message)
-        return
       }
     } catch {
       // 没有 logger 就退回 console。
     }
-    try {
-      console.log(`[cardcatalog] ${message}`)
-    } catch {
-      // 连 console 都没有也不能影响宿主。
+    if (mustBeVisible) {
+      // 这两句是启动验收要看的状态；DSH 默认只导出 warn/error，所以补一条 stderr。
+      try {
+        console.error(`[cardcatalog] ${message}`)
+      } catch {
+        // 连 console 都没有也不能影响宿主。
+      }
     }
   }
 }
@@ -605,6 +617,7 @@ function installPreStepSeam(ctx, getText, state, log) {
     ctx.on('agent/pre-step', async (payload, next) => {
       const decision = await next()
       try {
+        if (!state.config.enabled) return decision
         if (!decision || decision.kind !== 'enter') return decision
         if (!payload || payload.step !== 1) return decision
         const agent = payload.agent
@@ -636,6 +649,168 @@ function installPreStepSeam(ctx, getText, state, log) {
   }
 }
 
+const CONFIG_KEYS = [
+  'enabled',
+  'sources',
+  'injectAt',
+  'everyNTurns',
+  'maxLines',
+  'maxChars',
+  'lineMaxChars',
+  'showStale',
+  'header',
+]
+
+function previewFor(config) {
+  const notes = []
+  const rows = collectCatalog(config, { log: (message) => notes.push(message) })
+  const text = renderCatalog(rows, config)
+  return {
+    text,
+    lines: countCatalogLines(text),
+    rowCount: rows.length,
+    rows: rows.slice(0, 100).map((row) => ({
+      source: row.source,
+      title: row.title,
+      ageDays: row.ageDays,
+      stale: row.stale,
+    })),
+    notes,
+  }
+}
+
+function settingsCanWrite(ctx) {
+  const settings = getService(ctx, 'settings')
+  if (!settings || typeof settings.update !== 'function') return false
+  try {
+    return settings.writable === true
+  } catch {
+    return false
+  }
+}
+
+function sendJson(res, status, payload) {
+  try {
+    res.statusCode = status
+    res.setHeader('content-type', 'application/json; charset=utf-8')
+    res.setHeader('cache-control', 'no-store')
+    res.end(JSON.stringify(payload))
+  } catch {
+    // 客户端断开就算了。
+  }
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0
+    const chunks = []
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > 128 * 1024) {
+        reject(new Error('too large'))
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      try {
+        const text = Buffer.concat(chunks).toString('utf8').trim()
+        resolve(text ? JSON.parse(text) : {})
+      } catch {
+        reject(new Error('bad json'))
+      }
+    })
+    req.on('error', reject)
+  })
+}
+
+function registerApi(ctx, state, log, ensureSeams) {
+  if (state.apiRegistered) return
+  const webServer = getService(ctx, 'webServer')
+  if (!webServer || typeof webServer.register !== 'function') return
+  const configPathLabel = process.env.DSH_HOME
+    ? '$DSH_HOME/cardcatalog/config.json'
+    : '~/.dsh/cardcatalog/config.json'
+
+  const statePayload = () => ({
+    ok: true,
+    version: VERSION,
+    seam: state.seam,
+    settingsAvailable: settingsCanWrite(ctx),
+    configPath: configPathLabel,
+    config: state.config,
+    preview: previewFor(state.config),
+  })
+
+  const handler = async (req, res) => {
+    const url = new URL(req.url, 'http://127.0.0.1')
+    const path = url.pathname
+    if (req.method === 'GET' && (path === '/api/cardcatalog/state' || path === '/api/cardcatalog')) {
+      return sendJson(res, 200, statePayload())
+    }
+    if (req.method === 'POST' && path === '/api/cardcatalog/preview') {
+      const body = await readJsonBody(req)
+      const incoming = body && typeof body === 'object' ? (body.config ?? body) : {}
+      if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
+        return sendJson(res, 400, { ok: false, error: 'bad-config' })
+      }
+      const draft = normalizeConfig({ ...state.config, ...incoming })
+      return sendJson(res, 200, { ok: true, config: draft, preview: previewFor(draft) })
+    }
+    if (req.method === 'POST' && path === '/api/cardcatalog/config') {
+      const body = await readJsonBody(req)
+      const incoming = body && typeof body === 'object' ? (body.config ?? body) : {}
+      if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
+        return sendJson(res, 400, { ok: false, error: 'bad-config' })
+      }
+      if (!settingsCanWrite(ctx)) {
+        return sendJson(res, 409, {
+          ok: false,
+          error: 'settings-unavailable',
+          message: '当前宿主没有可写的设置服务；请直接编辑配置文件。',
+        })
+      }
+      const next = normalizeConfig({ ...state.config, ...incoming })
+      const patch = {}
+      for (const key of CONFIG_KEYS) {
+        if (key in incoming) patch[key] = next[key]
+      }
+      try {
+        await getService(ctx, 'settings').update(PLUGIN_NAME, patch)
+      } catch {
+        return sendJson(res, 500, { ok: false, error: 'settings-write-failed' })
+      }
+      state.config = next
+      state.loggedInjection = false
+      state.loggedEmpty = false
+      state.loggedError = false
+      ensureSeams()
+      return sendJson(res, 200, statePayload())
+    }
+    return sendJson(res, 404, { ok: false, error: 'not-found' })
+  }
+
+  try {
+    const dispose = webServer.register({
+      kind: 'prefix',
+      path: '/api/cardcatalog',
+      handler: async (req, res) => {
+        try {
+          await handler(req, res)
+        } catch {
+          sendJson(res, 400, { ok: false, error: 'bad-request' })
+        }
+      },
+    })
+    if (typeof ctx?.effect === 'function') {
+      ctx.effect(() => dispose, 'cardcatalog: settings api')
+    }
+    state.apiRegistered = true
+  } catch {
+    log('cardcatalog：设置页接口没挂上（宿主拒绝注册路由）')
+  }
+}
+
 function setup(ctx, rawConfig) {
   const log = makeLog(ctx)
   const usingFileFallback = Config === undefined
@@ -646,26 +821,16 @@ function setup(ctx, rawConfig) {
   const state = {
     config,
     seam: 'none',
+    apiRegistered: false,
     loggedInjection: false,
     loggedEmpty: false,
     loggedError: false,
   }
 
-  if (!config.enabled) {
-    log('cardcatalog：已停用，未注入任何记忆')
-    return
-  }
-  if (!config.sources.length) {
-    log('cardcatalog：没配 sources，未注入任何记忆')
-    return
-  }
-  if (!config.sources.some((source) => source.enabled)) {
-    log('cardcatalog：sources 全部停用，未注入任何记忆')
-    return
-  }
-
   const getText = () => {
     try {
+      if (!state.config.enabled) return ''
+      if (!state.config.sources.some((source) => source.enabled)) return ''
       const rows = collectCatalog(state.config, { log })
       const text = renderCatalog(rows, state.config)
       if (!text) {
@@ -689,16 +854,50 @@ function setup(ctx, rawConfig) {
     }
   }
 
-  if (installSystemPromptSeam(ctx, getText)) {
-    state.seam = 'system-prompt'
+  const ensureSeams = () => {
+    if (state.seam !== 'none') return
+    if (installSystemPromptSeam(ctx, getText)) {
+      state.seam = 'system-prompt'
+      return
+    }
+    if (installPreStepSeam(ctx, getText, state, log)) {
+      state.seam = 'message'
+      return
+    }
+    state.seam = 'none'
+    log('cardcatalog：当前宿主没有可用的注入接缝，未注入任何记忆')
+  }
+
+  // 设置页接口先挂上：没配 sources 时也能从界面补，而不是只能改文件。
+  // webServer 在 Web profile 里可能比本插件晚就绪，所以再挂一个注入等待。
+  registerApi(ctx, state, log, ensureSeams)
+  if (typeof ctx?.inject === 'function') {
+    try {
+      ctx.inject(['webServer'], (inner) => {
+        try {
+          registerApi(inner, state, log, ensureSeams)
+        } catch {
+          // 路由注册失败不影响注入。
+        }
+      })
+    } catch {
+      // 宿主没有 inject 能力时保持“没有设置页接口”的降级。
+    }
+  }
+
+  if (!config.enabled) {
+    log('cardcatalog：已停用，未注入任何记忆')
     return
   }
-  if (installPreStepSeam(ctx, getText, state, log)) {
-    state.seam = 'message'
+  if (!config.sources.length) {
+    log('cardcatalog：没配 sources，未注入任何记忆')
     return
   }
-  state.seam = 'none'
-  log('cardcatalog：当前宿主没有可用的注入接缝，未注入任何记忆')
+  if (!config.sources.some((source) => source.enabled)) {
+    log('cardcatalog：sources 全部停用，未注入任何记忆')
+    return
+  }
+  ensureSeams()
 }
 
 /**

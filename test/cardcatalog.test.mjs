@@ -90,6 +90,15 @@ test('T4 stale 标记正确：100 天前 + ttl 30 出现 ⚠️stale', () => {
   assert.ok(!text.includes('⚠️stale [env-facts] node-not-on-path'))
 })
 
+function removeDir(dir) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const target = join(dir, entry.name)
+    if (entry.isDirectory()) removeDir(target)
+    else unlinkSync(target)
+  }
+  rmdirSync(dir)
+}
+
 test('T5 删掉一个 source 文件：其余 source 正常且不抛异常', () => {
   const temp = mkdtempSync(join(tmpdir(), 'cardcatalog-test-'))
   cpSync(FIXTURES, temp, { recursive: true })
@@ -114,8 +123,7 @@ test('T5 删掉一个 source 文件：其余 source 正常且不抛异常', () =
     assert.equal(rows.length, 3)
     assert.ok(rows.every((row) => row.source === 'env-facts'))
   } finally {
-    for (const name of readdirSync(temp)) unlinkSync(join(temp, name))
-    rmdirSync(temp)
+    removeDir(temp)
   }
 })
 
@@ -227,6 +235,22 @@ test('T15 jsonl source 用 key/title/at 读出标题', () => {
   )
   const text = renderCatalog(rows, { maxLines: 7, maxChars: 2000 })
   assert.ok(text.includes('[reading-log] 示例条目甲 · 0 天前'))
+})
+
+test('T17 非字符串 title 不会把对象内容带进注入文本', () => {
+  const text = renderCatalog(
+    [{ source: 'demo', title: { text: 'SECRET_OBJECT_TITLE' }, ageDays: 0, stale: false }],
+    { maxLines: 7, maxChars: 2000 },
+  )
+  assert.ok(text.includes('[demo] <no-title>'))
+  assert.ok(!text.includes('SECRET_OBJECT_TITLE'))
+})
+
+test('T18 showStale=false 直接不注入过期条目', () => {
+  const text = renderCatalog(fixtureRows(), { maxLines: 20, maxChars: 5000, showStale: false })
+  assert.ok(!text.includes('⚠️stale'))
+  assert.ok(!text.includes('napcat-webui'))
+  assert.equal(countCatalogLines(text), 5)
 })
 
 test('T16 title 里的路径形状与目录标记被中和', () => {

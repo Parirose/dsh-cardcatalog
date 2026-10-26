@@ -1,0 +1,6 @@
+# Bundle patch：把本包的 host 半端挂进 profile 的配置树。
+# 安装方式：dsh plugin --profile web add dsh-cardcatalog
+# 或本地开发：dsh plugin --profile web add link:./dsh-cardcatalog
+- insert:
+    - id: cardcatalog
+      name: dsh-cardcatalog

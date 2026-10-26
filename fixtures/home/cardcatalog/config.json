@@ -1,0 +1,10 @@
+{
+  "sources": [
+    {
+      "id": "env-facts",
+      "kind": "facts",
+      "path": "%CARDCATALOG_TEST_FACTS%"
+    }
+  ],
+  "maxLines": 3
+}

@@ -1,0 +1,8 @@
+# README「设计启发（Credits）」允许出现的外部 URL。
+# 行内命中任一 URL 时，该行的路径/token 扫描跳过。
+# 仅此一处例外；其余位置仍适用零个人数据规则。
+https://github.com/Mr-Kopfkino/ATRI-Agent
+https://www.bilibili.com/video/BV1m5nS6BEHm
+https://www.bilibili.com/video/BV163HV6ZEhk
+https://github.com/BluePIEcom/dsh-reef
+https://github.com/wall1234567/dsh-rofm

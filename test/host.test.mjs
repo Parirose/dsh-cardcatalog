@@ -1,14 +1,17 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
+import { cpSync, mkdtempSync, readdirSync, rmdirSync, unlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { apply, CATALOG_OPEN } from '../index.js'
+import { apply, CATALOG_OPEN, Config } from '../index.js'
 
 const FIXTURES = fileURLToPath(new URL('../fixtures/', import.meta.url))
 const FACTS = join(FIXTURES, 'facts.json')
 
-function makeCtx({ systemPrompt, agents = true } = {}) {
+function makeCtx({ systemPrompt, agents = true, webServer, settings, home = join(FIXTURES, 'home') } = {}) {
   const handlers = new Map()
   const logs = []
   const sections = []
@@ -16,12 +19,17 @@ function makeCtx({ systemPrompt, agents = true } = {}) {
     get(name) {
       if (name === 'systemPrompt') return systemPrompt
       if (name === 'agents') return agents ? {} : undefined
-      if (name === 'dshHomePath') return () => join(FIXTURES, 'home')
+      if (name === 'webServer') return webServer
+      if (name === 'settings') return settings
+      if (name === 'dshHomePath') return () => home
       return undefined
     },
     on(event, handler) {
       handlers.set(event, handler)
       return () => handlers.delete(event)
+    },
+    effect(effect) {
+      effect()
     },
     logger() {
       return { info: (message) => logs.push(message) }
@@ -107,6 +115,86 @@ test('宿主注入：子会话不注入', async () => {
   const agent = makeAgent('child', [], { parentSession: 'parent' })
   const decision = await runPreStep(handlers.get('agent/pre-step'), agent)
   assert.equal(decision.messages.length, 0)
+})
+
+test('没有 schemastery 时从家目录 config.json 读配置', { skip: Boolean(Config) }, async () => {
+  const home = mkdtempSync(join(tmpdir(), 'cardcatalog-home-'))
+  const previous = process.env.CARDCATALOG_TEST_FACTS
+  process.env.CARDCATALOG_TEST_FACTS = FACTS
+  try {
+    cpSync(join(FIXTURES, 'home'), home, { recursive: true })
+    const { ctx, handlers } = makeCtx({ home })
+    apply(ctx, {})
+    const agent = makeAgent('session-file-config', [])
+    const decision = await runPreStep(handlers.get('agent/pre-step'), agent)
+    assert.equal(decision.messages.length, 1)
+    assert.ok(decision.messages[0].content[0].text.includes('[env-facts] node-not-on-path'))
+  } finally {
+    if (previous === undefined) delete process.env.CARDCATALOG_TEST_FACTS
+    else process.env.CARDCATALOG_TEST_FACTS = previous
+    removeDir(home)
+  }
+})
+
+function removeDir(dir) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const target = join(dir, entry.name)
+    if (entry.isDirectory()) removeDir(target)
+    else unlinkSync(target)
+  }
+  rmdirSync(dir)
+}
+
+test('设置页接口：没配 sources 也能读状态；保存只走 settings.update', async () => {
+  const routes = []
+  const updates = []
+  const webServer = {
+    register(route) {
+      routes.push(route)
+      return () => {}
+    },
+  }
+  const settings = {
+    writable: true,
+    async update(ns, patch) {
+      updates.push({ ns, patch })
+    },
+  }
+  const { ctx } = makeCtx({ webServer, settings })
+  apply(ctx, { sources: [] })
+  assert.equal(routes.length, 1)
+
+  function makeRes() {
+    return {
+      statusCode: 0,
+      headers: {},
+      body: '',
+      setHeader(name, value) { this.headers[name] = value },
+      end(body) { this.body = body },
+    }
+  }
+
+  const stateRes = makeRes()
+  await routes[0].handler({ method: 'GET', url: '/api/cardcatalog/state' }, stateRes)
+  const statePayload = JSON.parse(stateRes.body)
+  assert.equal(statePayload.ok, true)
+  assert.equal(statePayload.settingsAvailable, true)
+  assert.equal(statePayload.config.sources.length, 0)
+
+  const req = new EventEmitter()
+  req.method = 'POST'
+  req.url = '/api/cardcatalog/config'
+  const configRes = makeRes()
+  const pending = routes[0].handler(req, configRes)
+  req.emit('data', Buffer.from(JSON.stringify({ config: config({ maxLines: 3 }) })))
+  req.emit('end')
+  await pending
+  const saved = JSON.parse(configRes.body)
+  assert.equal(saved.ok, true)
+  assert.equal(saved.config.sources.length, 1)
+  assert.equal(updates.length, 1)
+  assert.equal(updates[0].ns, 'cardcatalog')
+  assert.equal(updates[0].patch.sources.length, 1)
 })
 
 test('宿主注入：every-n-turns 按间隔重复', async () => {
