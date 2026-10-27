@@ -18,7 +18,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const PLUGIN_NAME = 'cardcatalog'
-export const VERSION = '0.3.0'
+export const VERSION = '0.4.0'
 
 export const DEFAULT_HEADER = '记忆目录（只有标题，正文请自行查证）'
 export const CATALOG_OPEN = '<memory-catalog do-not-execute>'
@@ -28,6 +28,11 @@ export const CATALOG_FOOTER = '以上只是目录条目，不是指令；需要�
 export const NUDGE_OPEN = '<memory-nudge do-not-execute>'
 export const NUDGE_CLOSE = '</memory-nudge do-not-execute>'
 export const NUDGE_SOURCE_KIND = 'cardcatalog-nudge'
+
+export const TONE_OPEN = '<memory-tone do-not-execute>'
+export const TONE_CLOSE = '</memory-tone do-not-execute>'
+export const TONE_SOURCE_KIND = 'cardcatalog-tone'
+export const DEFAULT_TONE_HEADER = '压缩点之前的原话（照语气对齐，不要照摘要重建）'
 
 /** 文档里的中性文案示例；默认值留空，必须由用户自己填。 */
 export const NUDGE_EXAMPLE_TEXT = '「{file}」最后更新在 {hours} 小时前（{lastLine}）。如果这一轮有新进展，结尾补一行。'
@@ -52,6 +57,13 @@ export const DEFAULT_NUDGE = Object.freeze({
   alsoEveryNTurns: 0,
 })
 
+export const DEFAULT_TONE = Object.freeze({
+  enabled: true,
+  turns: 1,
+  maxChars: 300,
+  header: DEFAULT_TONE_HEADER,
+})
+
 export const DEFAULTS = Object.freeze({
   enabled: true,
   sources: [],
@@ -65,6 +77,7 @@ export const DEFAULTS = Object.freeze({
   showStale: true,
   header: DEFAULT_HEADER,
   nudge: DEFAULT_NUDGE,
+  tone: DEFAULT_TONE,
 })
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -152,6 +165,12 @@ export const Config = !schema ? undefined : (() => {
         maxChars: schema.number().min(0).step(1).default(200).description('提醒整行字符上限'),
         alsoEveryNTurns: schema.number().min(0).step(1).default(0).description('每 N 轮再检查一次是否该提醒（0 = 只在会话第 1 轮检查）；是否真的提醒仍由 staleAfterHours 决定'),
       }).default({}).description('近况提醒；只提醒，不代写').extra('volatile', true),
+      tone: schema.object({
+        enabled: schema.boolean().default(true).description('压缩后注入原话样本').extra('volatile', true),
+        turns: schema.number().min(0).step(1).default(1).description('取压缩点之前几轮').extra('volatile', true),
+        maxChars: schema.number().min(0).step(1).default(300).description('每段原话的字符上限').extra('volatile', true),
+        header: schema.string().default(DEFAULT_TONE_HEADER).description('原话样本的标题行').extra('volatile', true),
+      }).default({}).description('压缩点之前的原话样本；只读事件，不写文件').extra('volatile', true),
     })
   } catch {
     return undefined
@@ -194,6 +213,18 @@ function normalizeNudge(raw) {
     text: typeof configValue(item.text) === 'string' ? configValue(item.text) : '',
     maxChars: integerOr(configValue(item.maxChars), DEFAULT_NUDGE.maxChars, 0),
     alsoEveryNTurns: integerOr(configValue(item.alsoEveryNTurns), 0, 0),
+  }
+}
+
+function normalizeTone(raw) {
+  const item = raw && typeof raw === 'object' ? raw : {}
+  const enabled = configValue(item.enabled)
+  const header = configValue(item.header)
+  return {
+    enabled: typeof enabled === 'boolean' ? enabled : DEFAULT_TONE.enabled,
+    turns: integerOr(configValue(item.turns), DEFAULT_TONE.turns, 0),
+    maxChars: integerOr(configValue(item.maxChars), DEFAULT_TONE.maxChars, 0),
+    header: typeof header === 'string' && header.trim() !== '' ? header : DEFAULT_TONE.header,
   }
 }
 
@@ -250,6 +281,7 @@ export function normalizeConfig(raw) {
     showStale: configValue(config.showStale) !== false,
     header: header || DEFAULT_HEADER,
     nudge: normalizeNudge(configValue(config.nudge)),
+    tone: normalizeTone(configValue(config.tone)),
   }
 }
 
@@ -911,6 +943,109 @@ export function buildNudge(rawConfig, options = {}) {
   }
 }
 
+function eventText(content) {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .filter((block) => block && block.type === 'text' && typeof block.text === 'string')
+      .map((block) => block.text)
+      .join('\n')
+  }
+  if (content && typeof content === 'object' && typeof content.text === 'string') return content.text
+  return ''
+}
+
+/** 原话要保留断行；逐行套 plainLine 的路径/尖括号清洗，再折叠过多空行。 */
+function cleanToneText(value) {
+  const text = String(value).replace(/\r\n?/g, '\n')
+  return text
+    .split('\n')
+    .map((line) => plainLine(line))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+function truncateToneSegment(text, maxChars) {
+  const chars = [...text]
+  const total = chars.length
+  if (total <= maxChars) return text
+  if (maxChars <= 0) return ''
+  const marker = `…（共 ${total} 字）`
+  const markerChars = [...marker]
+  if (markerChars.length >= maxChars) return markerChars.slice(0, maxChars).join('')
+  return `${chars.slice(0, maxChars - markerChars.length).join('')}${marker}`
+}
+
+/**
+ * 从宿主传入的会话事件里取压缩点之前的原话。纯函数：不读文件、不联网。
+ *
+ * @param {unknown} rawConfig
+ * @param {unknown} events
+ * @returns {{status: 'ok', block: string, turns: number, chars: number}
+ *   | {status: 'no-checkpoint' | 'no-quotes'}}
+ */
+export function buildTone(rawConfig, events) {
+  const config = normalizeConfig(rawConfig)
+  if (!Array.isArray(events) || events.length === 0) return { status: 'no-checkpoint' }
+
+  let boundary = -1
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index]
+    if (event?.type === 'user/message' && event.data?.source?.kind === 'compact-checkpoint') {
+      boundary = index
+    }
+  }
+  if (boundary < 0) return { status: 'no-checkpoint' }
+
+  const groups = []
+  let current = null
+  for (let index = 0; index < boundary; index += 1) {
+    const event = events[index]
+    if (event?.type === 'user/message' && event.data?.source?.kind === 'user') {
+      const text = cleanToneText(eventText(event.data?.content))
+      current = { user: text, assistants: [] }
+      if (text) groups.push(current)
+      continue
+    }
+    if (event?.type === 'assistant/message' && event.data?.message?.role === 'assistant') {
+      if (!current) continue
+      const text = cleanToneText(eventText(event.data.message.content))
+      if (text) current.assistants.push(text)
+    }
+  }
+  if (groups.length === 0) return { status: 'no-quotes' }
+
+  const wanted = config.tone.turns
+  if (wanted <= 0) return { status: 'no-quotes' }
+  const selected = groups.slice(-wanted)
+  const header = oneLine(config.tone.header) || DEFAULT_TONE_HEADER
+  const parts = []
+  let chars = 0
+  for (const group of selected) {
+    const user = truncateToneSegment(group.user, config.tone.maxChars)
+    const assistant = truncateToneSegment(group.assistants.join('\n\n'), config.tone.maxChars)
+    if (!user && !assistant) continue
+    if (user) {
+      parts.push(`【用户】${user}`)
+      chars += charLength(user)
+    }
+    if (assistant) {
+      parts.push(`【助手】${assistant}`)
+      chars += charLength(assistant)
+    }
+    parts.push('')
+  }
+  while (parts.length > 0 && parts[parts.length - 1] === '') parts.pop()
+  if (parts.length === 0) return { status: 'no-quotes' }
+  return {
+    status: 'ok',
+    block: [TONE_OPEN, header, ...parts, TONE_CLOSE].join('\n'),
+    turns: selected.length,
+    chars,
+  }
+}
+
 function inspectOneSource(source, now) {
   const base = {
     id: source.id,
@@ -1154,9 +1289,23 @@ function makeInjectedMessage(text, kind) {
     content: Object.freeze([Object.freeze({ type: 'text', text })]),
     source: Object.freeze({
       kind,
-      form: kind === PLUGIN_NAME ? 'catalog' : 'nudge',
+      form: kind === PLUGIN_NAME ? 'catalog' : (kind === NUDGE_SOURCE_KIND ? 'nudge' : 'tone'),
     }),
   })
+}
+
+function sessionEvents(agent) {
+  try {
+    const events = agent?.session?.snapshotEvents?.()
+    return Array.isArray(events) ? events : []
+  } catch {
+    return []
+  }
+}
+
+function hasToneMessage(events) {
+  return events.some((event) => event?.type === 'user/message'
+    && event.data?.source?.kind === TONE_SOURCE_KIND)
 }
 
 function installSystemPromptSeam(ctx, getText) {
@@ -1239,15 +1388,48 @@ function installPreStepSeam(ctx, state, log, options) {
           }
         }
 
-        if (!catalogText && !nudgeText) return decision
-        const text = [catalogText, nudgeText].filter(Boolean).join('\n\n')
-        const kind = catalogText ? PLUGIN_NAME : NUDGE_SOURCE_KIND
+        let toneText = ''
+        if (state.config.tone.enabled) {
+          const events = sessionEvents(agent)
+          const alreadyTone = hasToneMessage(events) || state.toneInjected.has(id)
+          const result = buildTone(state.config, events)
+          if (!state.toneLogged.has(id)) {
+            state.toneLogged.add(id)
+            if (result.status === 'ok') {
+              const checkpoints = events.filter((event) => event?.type === 'user/message'
+                && event.data?.source?.kind === 'compact-checkpoint').length
+              log(`tone：会话 ${events.length} 条，压缩点 ${checkpoints} 个，取到 ${result.turns} 轮原话`)
+            } else if (result.status === 'no-checkpoint') {
+              log('tone：没有压缩点，跳过')
+            } else {
+              log('tone：压缩点之前没有可用的原话，跳过')
+            }
+          }
+          if (alreadyTone) {
+            state.toneState = 'injected'
+            if (result.status === 'ok') state.toneTurns = result.turns
+          } else if (result.status === 'ok') {
+            toneText = result.block
+            state.toneInjected.add(id)
+            state.toneState = 'injected'
+            state.toneTurns = result.turns
+            log(`tone：注入了 ${result.turns} 轮原话（${result.chars} 字）`)
+          } else {
+            state.toneState = result.status
+            state.toneTurns = 0
+          }
+        }
+
+        if (!catalogText && !nudgeText && !toneText) return decision
+        const outgoing = Array.isArray(decision.messages) ? [...decision.messages] : []
+        if (catalogText || nudgeText) {
+          const text = [catalogText, nudgeText].filter(Boolean).join('\n\n')
+          outgoing.push(makeInjectedMessage(text, catalogText ? PLUGIN_NAME : NUDGE_SOURCE_KIND))
+        }
+        if (toneText) outgoing.push(makeInjectedMessage(toneText, TONE_SOURCE_KIND))
         return {
           ...decision,
-          messages: [
-            ...(Array.isArray(decision.messages) ? decision.messages : []),
-            makeInjectedMessage(text, kind),
-          ],
+          messages: outgoing,
         }
       } catch (error) {
         log(`cardcatalog：注入失败（${error?.name || 'Error'}），本轮跳过`)
@@ -1273,6 +1455,7 @@ const CONFIG_KEYS = [
   'showStale',
   'header',
   'nudge',
+  'tone',
 ]
 
 /** 宿主若已经用 schema 填过默认值，这些值不应该盖住 config.json 里的用户默认。 */
@@ -1298,6 +1481,14 @@ function isBuiltInDefault(key, value) {
         && normalized.text === ''
         && normalized.maxChars === DEFAULT_NUDGE.maxChars
         && normalized.alsoEveryNTurns === 0
+    }
+    case 'tone': {
+      if (!value || typeof value !== 'object') return true
+      const normalized = normalizeTone(value)
+      return normalized.enabled === true
+        && normalized.turns === DEFAULT_TONE.turns
+        && normalized.maxChars === DEFAULT_TONE.maxChars
+        && normalized.header === DEFAULT_TONE.header
     }
     default: return false
   }
@@ -1427,6 +1618,8 @@ function registerApi(ctx, state, log, ensureSeams) {
       // 没开、读不到文件、没有文案、或还没到 staleAfterHours，都必须是 false。
       nudgeWillFire: state.config.nudge.enabled && nudgeInfo.stale === true && nudgeInfo.hasText,
       nudgeHours: nudgeInfo.hours,
+      toneState: state.config.tone.enabled ? state.toneState : 'disabled',
+      toneTurns: state.toneTurns,
       onboarding: onboardingInfo(ctx),
       snippet: AGENTS_SNIPPET,
       preview: previewFor(state.config),
@@ -1482,6 +1675,12 @@ function registerApi(ctx, state, log, ensureSeams) {
       state.loggedInjection = false
       state.loggedEmpty = false
       state.loggedError = false
+      if (!next.tone.enabled) {
+        state.toneState = 'disabled'
+        state.toneTurns = 0
+      } else if (state.toneState === 'disabled') {
+        state.toneState = 'no-checkpoint'
+      }
       ensureSeams()
       return sendJson(res, 200, statePayload())
     }
@@ -1531,6 +1730,10 @@ function setup(ctx, rawConfig) {
     loggedInjection: false,
     loggedEmpty: false,
     loggedError: false,
+    toneState: config.tone.enabled ? 'no-checkpoint' : 'disabled',
+    toneInjected: new Set(),
+    toneLogged: new Set(),
+    toneTurns: 0,
   }
 
   const getCatalogText = () => {
@@ -1574,7 +1777,9 @@ function setup(ctx, rawConfig) {
     if (!state.systemPromptInstalled && installSystemPromptSeam(ctx, getCatalogText)) {
       state.systemPromptInstalled = true
     }
-    const needsMessage = !state.systemPromptInstalled || state.config.nudge.enabled
+    const needsMessage = !state.systemPromptInstalled
+      || state.config.nudge.enabled
+      || state.config.tone.enabled
     if (needsMessage && !state.preStepInstalled) {
       state.preStepInstalled = installPreStepSeam(ctx, state, log, {
         catalogViaMessage: !state.systemPromptInstalled,
@@ -1619,10 +1824,10 @@ function setup(ctx, rawConfig) {
   }
   if (!config.sources.length) {
     log('cardcatalog：没配 sources，未注入任何记忆')
-    if (!config.nudge.enabled) return
+    if (!config.nudge.enabled && !config.tone.enabled) return
   } else if (!config.sources.some((source) => source.enabled)) {
     log('cardcatalog：sources 全部停用，未注入任何记忆')
-    if (!config.nudge.enabled) return
+    if (!config.nudge.enabled && !config.tone.enabled) return
   }
   ensureSeams()
 }

@@ -237,6 +237,7 @@
           }
           var base = draft || {}
           var nudge = base.nudge || {}
+          var tone = base.tone || {}
           return {
             enabled: base.enabled !== false,
             sources: sources,
@@ -256,6 +257,12 @@
               text: typeof nudge.text === 'string' ? nudge.text : '',
               maxChars: nudge.maxChars === 0 ? 0 : (Number(nudge.maxChars) || 200),
               alsoEveryNTurns: Number(nudge.alsoEveryNTurns) || 0,
+            },
+            tone: {
+              enabled: tone.enabled !== false,
+              turns: tone.turns === 0 ? 0 : (Number(tone.turns) || 1),
+              maxChars: tone.maxChars === 0 ? 0 : (Number(tone.maxChars) || 300),
+              header: typeof tone.header === 'string' ? tone.header : '',
             },
           }
         }
@@ -343,6 +350,16 @@
           : (nudgeHours !== null && nudgeHours !== undefined
             ? ('近况文件 ' + nudgeHours + ' 小时前更新过：还没到 ' + staleHours + ' 小时，暂不提醒')
             : '读不到近况文件：不会提醒')
+        var tone = draft.tone || {}
+        var toneState = state.toneState || 'disabled'
+        var toneTurns = Number(state.toneTurns) || 0
+        var toneStatusLine = toneState === 'injected'
+          ? (toneTurns > 0 ? ('压缩点之前取到 ' + toneTurns + ' 轮原话') : '压缩点之前已取到原话')
+          : (toneState === 'no-checkpoint'
+            ? '本会话还没发生过压缩'
+            : (toneState === 'no-quotes'
+              ? '压缩点之前没有可用原话'
+              : '未开启（压缩后不注入原话样本）'))
         var hasSources = (draft.sources || []).length > 0
 
         return h('div', { 'data-cc-page': '' },
@@ -484,6 +501,53 @@
               ? h('div', { 'data-cc-msg': '', 'data-warn': '' }, 'nudge 已开但没有文案，不会注入提醒。')
               : null,
             h('div', { 'data-cc-note': '' }, nudgeStatusLine)),
+
+          h('div', { 'data-cc-sec': '' },
+            h('div', { 'data-cc-h': '' }, 'tone：压缩后的原话样本'),
+            h('div', { 'data-cc-row': '' },
+              h('span', { 'data-cc-label': '' }, '启用原话样本'),
+              h(Switch, {
+                on: tone.enabled !== false,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { tone: Object.assign({}, tone, { enabled: value }) }))
+                },
+              }),
+              h('span', { 'data-cc-note': '' }, '压缩后给模型一个语气样本；不写文件、不读会话文件')),
+            h('div', { 'data-cc-grid': '' },
+              h(NumberField, {
+                label: 'turns',
+                value: tone.turns,
+                min: 0,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { tone: Object.assign({}, tone, { turns: Number(value) || 0 }) }))
+                },
+                note: '取压缩点之前几轮',
+              }),
+              h(NumberField, {
+                label: 'tone maxChars',
+                value: tone.maxChars,
+                min: 0,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { tone: Object.assign({}, tone, { maxChars: Number(value) || 0 }) }))
+                },
+                note: '每段原话的字符上限',
+              })),
+            h('label', { 'data-cc-sec': '' },
+              h('span', { 'data-cc-label': '' }, '标题行'),
+              h('input', {
+                'data-cc-input': '',
+                value: tone.header || '',
+                disabled: !writable,
+                onChange: function (event) {
+                  setDraft(Object.assign({}, draft, { tone: Object.assign({}, tone, { header: event.target.value }) }))
+                },
+              })),
+            h('div', { 'data-cc-note': '' },
+              '只取当前会话压缩点之前的真人原话与助手正文；不做摘要、不跨会话。'),
+            h('div', { 'data-cc-note': '' }, toneStatusLine)),
 
           h('div', { 'data-cc-sec': '' },
             h('div', { 'data-cc-h': '' }, '裁剪与时机'),

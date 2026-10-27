@@ -18,6 +18,7 @@ function makeCtx(webServer) {
     get(name) {
       if (name === 'agents') return {}
       if (name === 'webServer') return webServer
+      if (name === 'dshHomePath') return () => join(FIXTURES, 'no-home')
       return undefined
     },
     on(event, handler) {

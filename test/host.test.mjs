@@ -107,7 +107,7 @@ test('去重只看 source.kind：正文里贴目录样例不算已注入', async
 test('宿主注入：有 systemPrompt 时优先贡献 section', () => {
   const systemPrompt = {}
   const { ctx, handlers, sections } = makeCtx({ systemPrompt })
-  apply(ctx, config())
+  apply(ctx, config({ tone: { enabled: false } }))
   assert.equal(handlers.size, 0)
   assert.equal(sections.length, 1)
   assert.equal(sections[0].name, 'cardcatalog')
@@ -125,7 +125,7 @@ test('宿主注入：没有 systemPrompt 也没有 agents 时明说没有接缝'
 
 test('宿主注入：没配 sources 时一行都不注入，日志是固定那句', () => {
   const { ctx, handlers, logs } = makeCtx()
-  apply(ctx, { sources: [] })
+  apply(ctx, { sources: [], tone: { enabled: false } })
   assert.equal(handlers.size, 0)
   assert.ok(logs.includes('cardcatalog：没配 sources，未注入任何记忆'))
 })
@@ -275,6 +275,8 @@ test('设置页接口：来源状态卡四态、onboarding 与可复制片段', 
   assert.equal(typeof payload.onboarding.agentsExists, 'boolean')
   assert.ok(payload.snippet.includes('<memory-catalog do-not-execute>'))
   assert.equal(payload.nudge.status, 'disabled')
+  assert.equal(payload.toneState, 'no-checkpoint')
+  assert.equal(payload.toneTurns, 0)
 })
 
 test('设置页接口：先有系统提示、后开 nudge 时补挂消息接缝', async () => {
@@ -292,7 +294,10 @@ test('设置页接口：先有系统提示、后开 nudge 时补挂消息接缝'
   }
   const systemPrompt = {}
   const { ctx, handlers } = makeCtx({ systemPrompt, webServer, settings })
-  apply(ctx, { sources: [{ id: 'env-facts', kind: 'facts', path: FACTS }] })
+  apply(ctx, {
+    sources: [{ id: 'env-facts', kind: 'facts', path: FACTS }],
+    tone: { enabled: false },
+  })
   assert.equal(handlers.size, 0)
 
   const req = new EventEmitter()
