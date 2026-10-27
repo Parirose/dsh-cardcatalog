@@ -18,7 +18,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const PLUGIN_NAME = 'cardcatalog'
-export const VERSION = '0.4.0'
+export const VERSION = '0.4.1'
 
 export const DEFAULT_HEADER = '记忆目录（只有标题，正文请自行查证）'
 export const CATALOG_OPEN = '<memory-catalog do-not-execute>'
@@ -88,7 +88,7 @@ const HOUR_MS = 60 * 60 * 1000
  * undefined，插件照常加载，只是没有设置面板、改为读取家目录里的 config.json。
  * 绝不因为一个 UI 依赖让整条插件不激活。
  */
-async function loadSchemastery() {
+export async function loadSchemastery() {
   const candidates = ['@deepseek-ai/schemastery']
   const add = (file) => {
     if (file && existsSync(file)) candidates.push(pathToFileURL(file).href)
@@ -123,12 +123,11 @@ async function loadSchemastery() {
 const schema = await loadSchemastery()
 
 /**
- * 配置 schema 全部 optional、默认空。每个字段都标 volatile：宿主的设置页
- * 只接受 volatile 字段的写入。
+ * 配置 schema 全部 optional、默认空。只有对象级字段可标 volatile；子字段与
+ * list 子项一律不标——宿主的 volatile 校验不允许 volatile 嵌套 volatile。
  */
-export const Config = !schema ? undefined : (() => {
-  try {
-    return schema.object({
+export function createConfigSchema(schema) {
+  return schema.object({
       enabled: schema.boolean().default(true).description('总开关').extra('volatile', true),
       sources: schema.array(schema.object({
         id: schema.string().default('').description('给人看的来源名'),
@@ -166,12 +165,17 @@ export const Config = !schema ? undefined : (() => {
         alsoEveryNTurns: schema.number().min(0).step(1).default(0).description('每 N 轮再检查一次是否该提醒（0 = 只在会话第 1 轮检查）；是否真的提醒仍由 staleAfterHours 决定'),
       }).default({}).description('近况提醒；只提醒，不代写').extra('volatile', true),
       tone: schema.object({
-        enabled: schema.boolean().default(true).description('压缩后注入原话样本').extra('volatile', true),
-        turns: schema.number().min(0).step(1).default(1).description('取压缩点之前几轮').extra('volatile', true),
-        maxChars: schema.number().min(0).step(1).default(300).description('每段原话的字符上限').extra('volatile', true),
-        header: schema.string().default(DEFAULT_TONE_HEADER).description('原话样本的标题行').extra('volatile', true),
+        enabled: schema.boolean().default(true).description('压缩后注入原话样本'),
+        turns: schema.number().min(0).step(1).default(1).description('取压缩点之前几轮'),
+        maxChars: schema.number().min(0).step(1).default(300).description('每段原话的字符上限'),
+        header: schema.string().default(DEFAULT_TONE_HEADER).description('原话样本的标题行'),
       }).default({}).description('压缩点之前的原话样本；只读事件，不写文件').extra('volatile', true),
     })
+}
+
+export const Config = !schema ? undefined : (() => {
+  try {
+    return createConfigSchema(schema)
   } catch {
     return undefined
   }
@@ -1303,9 +1307,30 @@ function sessionEvents(agent) {
   }
 }
 
-function hasToneMessage(events) {
-  return events.some((event) => event?.type === 'user/message'
-    && event.data?.source?.kind === TONE_SOURCE_KIND)
+function lastCheckpointIndex(events) {
+  let boundary = -1
+  for (let index = 0; index < events.length; index += 1) {
+    if (events[index]?.type === 'user/message'
+      && events[index].data?.source?.kind === 'compact-checkpoint') boundary = index
+  }
+  return boundary
+}
+
+/** 压缩点的稳定键：优先 seq；没有 seq 时才退回事件位置。 */
+function checkpointKey(events, boundary) {
+  if (boundary < 0) return null
+  const seq = events[boundary]?.seq
+  return seq === undefined || seq === null ? `index:${boundary}` : `seq:${seq}`
+}
+
+/** 只认最后一个压缩点之后的 tone，之前的旧样本不能挡住新压缩点。 */
+function hasToneAfterCheckpoint(events, boundary) {
+  if (boundary < 0) return false
+  for (let index = boundary + 1; index < events.length; index += 1) {
+    const event = events[index]
+    if (event?.type === 'user/message' && event.data?.source?.kind === TONE_SOURCE_KIND) return true
+  }
+  return false
 }
 
 function installSystemPromptSeam(ctx, getText) {
@@ -1391,7 +1416,10 @@ function installPreStepSeam(ctx, state, log, options) {
         let toneText = ''
         if (state.config.tone.enabled) {
           const events = sessionEvents(agent)
-          const alreadyTone = hasToneMessage(events) || state.toneInjected.has(id)
+          const boundary = lastCheckpointIndex(events)
+          const key = checkpointKey(events, boundary)
+          const alreadyTone = key !== null
+            && (state.toneCheckpoints.get(id) === key || hasToneAfterCheckpoint(events, boundary))
           const result = buildTone(state.config, events)
           if (!state.toneLogged.has(id)) {
             state.toneLogged.add(id)
@@ -1406,11 +1434,12 @@ function installPreStepSeam(ctx, state, log, options) {
             }
           }
           if (alreadyTone) {
+            state.toneCheckpoints.set(id, key)
             state.toneState = 'injected'
             if (result.status === 'ok') state.toneTurns = result.turns
           } else if (result.status === 'ok') {
             toneText = result.block
-            state.toneInjected.add(id)
+            state.toneCheckpoints.set(id, key)
             state.toneState = 'injected'
             state.toneTurns = result.turns
             log(`tone：注入了 ${result.turns} 轮原话（${result.chars} 字）`)
@@ -1731,7 +1760,7 @@ function setup(ctx, rawConfig) {
     loggedEmpty: false,
     loggedError: false,
     toneState: config.tone.enabled ? 'no-checkpoint' : 'disabled',
-    toneInjected: new Set(),
+    toneCheckpoints: new Map(),
     toneLogged: new Set(),
     toneTurns: 0,
   }

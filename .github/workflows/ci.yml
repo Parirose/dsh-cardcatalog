@@ -22,3 +22,7 @@ jobs:
         run: npm run check:privacy
       - name: Read-only
         run: npm run check:readonly
+      - name: Schema
+        run: |
+          npm install --no-save --no-package-lock --ignore-scripts @deepseek-ai/schemastery@~3.18.5
+          npm run check:schema

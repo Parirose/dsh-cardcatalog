@@ -1,6 +1,6 @@
 {
   "name": "dsh-cardcatalog",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "目录卡：把用户自己维护的记忆账本投影成标题级上下文，可选 markdown 小节、只读近况提醒与压缩后原话样本。只读、不存储、不检索。",
   "displayName": "目录卡",
   "type": "module",
@@ -27,7 +27,8 @@
     "test": "node --test test/cardcatalog.test.mjs test/host.test.mjs test/client.test.mjs test/v020.test.mjs test/v030.test.mjs test/v040.test.mjs",
     "check:privacy": "node ci/check-privacy.mjs",
     "check:readonly": "node ci/check-readonly.mjs",
-    "check": "npm test && npm run check:privacy && npm run check:readonly"
+    "check:schema": "node ci/check-schema.mjs",
+    "check": "npm test && npm run check:privacy && npm run check:readonly && npm run check:schema"
   },
   "peerDependencies": {
     "@deepseek-ai/schemastery": ">=3.18.0"

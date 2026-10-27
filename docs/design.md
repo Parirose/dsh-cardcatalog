@@ -95,8 +95,8 @@ README 的「设计启发（Credits）」列出了思路来源。这里说清边
 
 ### nudge 的接缝
 
-`nudge` 需要知道“第几轮”，`tone` 需要读取会话事件并只在首次出现时注入，所以两者
-都不能塞进稳定的系统提示 section。它们单独走 `agent/pre-step`：
+`nudge` 需要知道“第几轮”，`tone` 需要读取会话事件并只在每个压缩点首次出现时注入，
+所以两者都不能塞进稳定的系统提示 section。它们单独走 `agent/pre-step`：
 
 - 目录已经走系统提示时，仍然注册一个轻量的 pre-step，只负责 nudge；
 - 目录也走消息时，两者可以合并成一条消息；
@@ -193,7 +193,7 @@ README 的「设计启发（Credits）」列出了思路来源。这里说清边
   公平配额、stale 预算、markdown 与 nudge 的纯函数行为”。
 - v0.2.0 新增 T7–T15：markdown 小节白名单、尾部行、截断、引用/注释剔除、nudge 过期与
   文件不存在、无 sources 状态卡、只读断言。
-- v0.4.0 新增 T1–T6：合成事件数组上的压缩点、原话提取、清洗、截断和只注入一次。
+- v0.4.0 新增 T1–T6：合成事件数组上的压缩点、原话提取、清洗、截断和每个压缩点只注入一次。
 - 宿主接缝测试用假 context：验证系统提示优先、消息接缝只注入一次、子会话跳过、
   `every-n-turns` 间隔，以及“系统提示目录 + 消息 nudge”的混合路径。
 - 隐私检查扫源码、文档、fixture；只读检查扫源码里的写 API。
@@ -240,7 +240,18 @@ README 的「设计启发（Credits）」列出了思路来源。这里说清边
 - `buildTone(config, events)` 是纯函数，只接收事件数组；
 - 只收 `source.kind === 'user'` 的真人消息和 `assistant/message` 的正文，跳过所有注入物；
 - 事件读不到、没有压缩点、压缩点之前没有原话，都直接跳过，不猜；
-- 注入源用独立的 `cardcatalog-tone`，不参与目录去重。
+- 注入源用独立的 `cardcatalog-tone`，不参与目录去重；去重键是最后一个压缩点的 `seq`，
+  因此新压缩点会刷新样本，旧压缩点的 tone 不会挡住新样本。
 
 代价是它只对“当前会话、且宿主内存里仍保留压缩点之前事件”的会话生效；这是刻意的边界。
 跨会话或读盘会让它变成另一个存储系统，也会把“只读”承诺弄复杂。
+
+## 15. 为什么有 check:schema
+
+配置 schema 只有在宿主能解析到 schemastery 时才会被构造并校验；普通单测跑在
+`Config === undefined` 的降级路径上，所以“子字段又标一次 volatile”这类错误可以不红。
+`ci/check-schema.mjs` 专门构造一次 `Config`，让宿主的 `validateVolatileSchema` 自己跑；
+解析不到 schemastery 时明确打印 skipped，不静默通过。
+
+这里也留下一条规则：**只有对象级字段可标 volatile；子字段与 list 子项一律不标。**
+`nudge` 一直遵守它，`tone` 曾经违反它，导致整个 `Config` 被宿主拒绝。

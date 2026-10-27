@@ -138,7 +138,7 @@ test('T3 压缩点之前只有注入物、没有真人消息：no-quotes，不�
   assert.deepEqual(result, { status: 'no-quotes' })
 })
 
-test('T4 同一会话只注入一次：turn 1 有 tone，turn 2 为空', async () => {
+test('T4 同一次压缩只注入一次，新压缩点再注入一次', async () => {
   const { ctx, handlers, logs } = makeCtx()
   apply(ctx, {
     sources: [],
@@ -161,6 +161,17 @@ test('T4 同一会话只注入一次：turn 1 有 tone，turn 2 为空', async (
   assert.ok(logs.some((line) => line.startsWith('tone：注入了 1 轮原话')))
   const second = await runPreStep(handler, agent, 2)
   assert.equal(second.messages.length, 0)
+
+  events.push(
+    userEvent('第二次原话', 4),
+    assistantEvent('第二次助手正文', 5),
+    checkpointEvent(6),
+  )
+  const third = await runPreStep(handler, agent, 3)
+  assert.equal(third.messages.length, 1)
+  assert.equal(third.messages[0].source.kind, TONE_SOURCE_KIND)
+  assert.ok(third.messages[0].content[0].text.includes('第二次原话'))
+  assert.equal(logs.filter((line) => line.startsWith('tone：注入了')).length, 2)
 })
 
 test('T5 清洗：路径变 [path]，原话换行保留', () => {

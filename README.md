@@ -196,7 +196,7 @@ tone:
 </memory-tone do-not-execute>
 ```
 
-- 每个会话只注入一次；诊断日志会写：
+- 每个压缩点只注入一次；出现新压缩点会再注入一次。诊断日志会写：
   `tone：会话 N 条，压缩点 K 个，取到 T 轮原话`，或
   `tone：没有压缩点，跳过` / `tone：压缩点之前没有可用的原话，跳过`。
 - 它只读事件、只注入文本；不写文件、不做摘要、不跨会话。
@@ -366,7 +366,11 @@ node --check client.js
 npm test
 npm run check:privacy
 npm run check:readonly
+npm run check:schema
 ```
+
+`check:schema` 会在能解析到 `@deepseek-ai/schemastery` 时构造一次 `Config`，
+让宿主自己的 volatile 校验跑一遍；解析不到时明确打印 skipped，不静默通过。
 
 测试自带 fixture，不依赖真账本；缺文件场景会在临时目录里复制 fixture 再删掉一个来源。
 只读断言会扫描源码里的写 API；nudge 的 fixture 也用临时副本改 mtime，不改仓库文件。
