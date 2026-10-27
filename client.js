@@ -238,6 +238,7 @@
           var base = draft || {}
           var nudge = base.nudge || {}
           var tone = base.tone || {}
+          var wall = base.wall || {}
           return {
             enabled: base.enabled !== false,
             sources: sources,
@@ -263,6 +264,11 @@
               turns: tone.turns === 0 ? 0 : (Number(tone.turns) || 1),
               maxChars: tone.maxChars === 0 ? 0 : (Number(tone.maxChars) || 300),
               header: typeof tone.header === 'string' ? tone.header : '',
+            },
+            wall: {
+              enabled: wall.enabled !== false,
+              turns: wall.turns === 0 ? 0 : (Number(wall.turns) || 2),
+              header: typeof wall.header === 'string' ? wall.header : '',
             },
           }
         }
@@ -360,6 +366,22 @@
             : (toneState === 'no-quotes'
               ? '压缩点之前没有可用原话'
               : '未开启（压缩后不注入原话样本）'))
+        var wall = draft.wall || {}
+        var wallState = state.wallState || 'disabled'
+        var wallCount = Number(state.wallCount) || 0
+        var wallLastMinutes = state.wallLastMinutes
+        var wallStatusLine = wallState === 'injected'
+          ? (wallCount > 0
+            ? ('本会话压缩过 ' + wallCount + ' 次'
+              + (wallLastMinutes !== null && wallLastMinutes !== undefined
+                ? '，最后一次 ' + wallLastMinutes + ' 分钟前'
+                : ''))
+            : '压缩痕迹已注入')
+          : (wallState === 'no-checkpoint'
+            ? '本会话还没被压缩过'
+            : (wallState === 'already'
+              ? '压缩痕迹已注入过，等待下一次压缩'
+              : '已关闭'))
         var hasSources = (draft.sources || []).length > 0
 
         return h('div', { 'data-cc-page': '' },
@@ -548,6 +570,33 @@
             h('div', { 'data-cc-note': '' },
               '只取当前会话压缩点之前的真人原话与助手正文；不做摘要、不跨会话。'),
             h('div', { 'data-cc-note': '' }, toneStatusLine)),
+
+          h('div', { 'data-cc-sec': '' },
+            h('div', { 'data-cc-h': '' }, 'wall：压缩痕迹'),
+            h('div', { 'data-cc-row': '' },
+              h('span', { 'data-cc-label': '' }, '启用压缩痕迹'),
+              h(Switch, {
+                on: wall.enabled !== false,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { wall: Object.assign({}, wall, { enabled: value }) }))
+                },
+              }),
+              h('span', { 'data-cc-note': '' }, '压缩后报一次次数、多久前、压掉多少；不含内容摘要')),
+            h('div', { 'data-cc-grid': '' },
+              h(NumberField, {
+                label: 'turns',
+                value: wall.turns,
+                min: 0,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { wall: Object.assign({}, wall, { turns: Number(value) || 0 }) }))
+                },
+                note: '提示里建议回取的原话轮数',
+              })),
+            h('div', { 'data-cc-note': '' },
+              '只报元信息与找回命令；不摘要、不估 token、不写文件。'),
+            h('div', { 'data-cc-note': '' }, wallStatusLine)),
 
           h('div', { 'data-cc-sec': '' },
             h('div', { 'data-cc-h': '' }, '裁剪与时机'),

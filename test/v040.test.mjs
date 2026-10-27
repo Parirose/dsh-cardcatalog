@@ -143,6 +143,7 @@ test('T4 同一次压缩只注入一次，新压缩点再注入一次', async ()
   apply(ctx, {
     sources: [],
     tone: { enabled: true, turns: 1, maxChars: 300 },
+    wall: { enabled: false },
   })
   const handler = handlers.get('agent/pre-step')
   assert.equal(typeof handler, 'function')

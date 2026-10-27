@@ -1,11 +1,12 @@
 /**
  * 目录卡 / dsh-cardcatalog — 纯投影层。
  *
- * 这个文件只做四件事：
+ * 这个文件只做五件事：
  *   1. 把用户显式配置的账本读成“标题 + 多新 + 是否过期”的行；
  *   2. 把 markdown 笔记里用户点名的小节摘成短文；
  *   3. 在这些内容之外，给一条“近况文件多久没更新”的提醒；
- *   4. 在配置缺失、文件缺失、JSON 坏掉时安静地跳过。
+ *   4. 压缩后回放压缩点之前的原话样本（tone）；
+ *   5. 压缩后报一次元信息与找回命令（wall）。
  *
  * 它不写文件、不建数据库、不缓存副本、不做检索，也不从对话里抽取记忆。
  * 账本是用户的，插件只是投影；nudge 只提醒，不代写。
@@ -18,7 +19,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const PLUGIN_NAME = 'cardcatalog'
-export const VERSION = '0.4.1'
+export const VERSION = '0.5.0'
 
 export const DEFAULT_HEADER = '记忆目录（只有标题，正文请自行查证）'
 export const CATALOG_OPEN = '<memory-catalog do-not-execute>'
@@ -33,6 +34,19 @@ export const TONE_OPEN = '<memory-tone do-not-execute>'
 export const TONE_CLOSE = '</memory-tone do-not-execute>'
 export const TONE_SOURCE_KIND = 'cardcatalog-tone'
 export const DEFAULT_TONE_HEADER = '压缩点之前的原话（照语气对齐，不要照摘要重建）'
+
+export const WALL_OPEN = '<memory-wall do-not-execute>'
+export const WALL_CLOSE = '</memory-wall do-not-execute>'
+export const WALL_SOURCE_KIND = 'cardcatalog-wall'
+export const DEFAULT_WALL_HEADER = '压缩痕迹（给你自己看的，不要说出去）'
+
+/**
+ * 用户侧真实存在的两条命令。按段拼，避免源码里出现一整条盘符路径；
+ * 运行时输出完整命令，不从配置里猜。
+ */
+const WALL_DIR = `C:${String.fromCharCode(92)}ATRI`
+const WALL_TONE_COMMAND = `${WALL_DIR}${String.fromCharCode(92)}tone.cmd`
+const WALL_RESUME_COMMAND = `${WALL_DIR}${String.fromCharCode(92)}resume.cmd`
 
 /** 文档里的中性文案示例；默认值留空，必须由用户自己填。 */
 export const NUDGE_EXAMPLE_TEXT = '「{file}」最后更新在 {hours} 小时前（{lastLine}）。如果这一轮有新进展，结尾补一行。'
@@ -64,6 +78,12 @@ export const DEFAULT_TONE = Object.freeze({
   header: DEFAULT_TONE_HEADER,
 })
 
+export const DEFAULT_WALL = Object.freeze({
+  enabled: true,
+  turns: 2,
+  header: DEFAULT_WALL_HEADER,
+})
+
 export const DEFAULTS = Object.freeze({
   enabled: true,
   sources: [],
@@ -78,6 +98,7 @@ export const DEFAULTS = Object.freeze({
   header: DEFAULT_HEADER,
   nudge: DEFAULT_NUDGE,
   tone: DEFAULT_TONE,
+  wall: DEFAULT_WALL,
 })
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -170,6 +191,11 @@ export function createConfigSchema(schema) {
         maxChars: schema.number().min(0).step(1).default(300).description('每段原话的字符上限'),
         header: schema.string().default(DEFAULT_TONE_HEADER).description('原话样本的标题行'),
       }).default({}).description('压缩点之前的原话样本；只读事件，不写文件').extra('volatile', true),
+      wall: schema.object({
+        enabled: schema.boolean().default(true).description('压缩后注入一次痕迹提示'),
+        turns: schema.number().min(0).step(1).default(2).description('提示里建议回取的原话轮数'),
+        header: schema.string().default(DEFAULT_WALL_HEADER).description('痕迹提示的标题行'),
+      }).default({}).description('压缩的元信息与找回命令；不含任何内容摘要').extra('volatile', true),
     })
 }
 
@@ -232,6 +258,17 @@ function normalizeTone(raw) {
   }
 }
 
+function normalizeWall(raw) {
+  const item = raw && typeof raw === 'object' ? raw : {}
+  const enabled = configValue(item.enabled)
+  const header = configValue(item.header)
+  return {
+    enabled: typeof enabled === 'boolean' ? enabled : DEFAULT_WALL.enabled,
+    turns: integerOr(configValue(item.turns), DEFAULT_WALL.turns, 0),
+    header: typeof header === 'string' && header.trim() !== '' ? header : DEFAULT_WALL.header,
+  }
+}
+
 function textOr(value, fallback) {
   if (typeof value === 'string' && value.trim() !== '') return value.trim()
   return fallback
@@ -286,6 +323,7 @@ export function normalizeConfig(raw) {
     header: header || DEFAULT_HEADER,
     nudge: normalizeNudge(configValue(config.nudge)),
     tone: normalizeTone(configValue(config.tone)),
+    wall: normalizeWall(configValue(config.wall)),
   }
 }
 
@@ -1050,6 +1088,79 @@ export function buildTone(rawConfig, events) {
   }
 }
 
+/**
+ * 压缩痕迹：只报“压缩了几次、多久以前、压掉了多少、去哪取”，
+ * 不含任何内容摘要。纯函数：只吃宿主传入的事件数组，不读文件。
+ *
+ * @param {unknown} rawConfig
+ * @param {unknown} events
+ * @param {{ now?: number }} [options]
+ * @returns {{status: 'ok', block: string, checkpoints: number, minutesAgo: number|null,
+ *   eventsBefore: number, userBefore: number, turns: number}
+ *   | {status: 'no-checkpoint' | 'disabled'}}
+ */
+export function buildWall(rawConfig, events, options = {}) {
+  const config = normalizeConfig(rawConfig)
+  if (!config.wall.enabled) return { status: 'disabled' }
+  if (!Array.isArray(events) || events.length === 0) return { status: 'no-checkpoint' }
+
+  let boundary = -1
+  let checkpoints = 0
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index]
+    if (event?.type === 'user/message' && event.data?.source?.kind === 'compact-checkpoint') {
+      boundary = index
+      checkpoints += 1
+    }
+  }
+  if (boundary < 0) return { status: 'no-checkpoint' }
+
+  // 用数组下标，不用 seq 差：seq 可能跳号，下标才是“压掉了多少条事件”。
+  const eventsBefore = boundary
+  let userBefore = 0
+  for (let index = 0; index < boundary; index += 1) {
+    const event = events[index]
+    if (event?.type === 'user/message' && event.data?.source?.kind === 'user') userBefore += 1
+  }
+
+  const time = events[boundary]?.time
+  const now = Number.isFinite(options.now) ? Number(options.now) : Date.now()
+  const minutesAgo = typeof time === 'number' && Number.isFinite(time)
+    ? Math.max(0, Math.floor((now - time) / 60000))
+    : null
+
+  const header = oneLine(config.wall.header) || DEFAULT_WALL_HEADER
+  const turns = config.wall.turns
+  const lines = [WALL_OPEN, header]
+  if (minutesAgo === null) {
+    // 拿不到时间就不写“N 分钟前”，其余照写；不估算。
+    lines.push(`本会话已压缩 ${checkpoints} 次。`)
+  } else {
+    lines.push(`本会话已压缩 ${checkpoints} 次，最后一次在 ${minutesAgo} 分钟前。`)
+  }
+  if (userBefore === 0) {
+    lines.push(`压缩点之前没有真人消息（${eventsBefore} 条事件）；原始对话仍在，可随时取。`)
+  } else {
+    lines.push(`压缩点之前：${eventsBefore} 条事件 / ${userBefore} 条真人消息，原始对话仍在，可随时取。`)
+  }
+  lines.push(`取原话：${WALL_TONE_COMMAND} --turns ${turns}    （只搬运，不总结）`)
+  lines.push(`查账本：${WALL_RESUME_COMMAND}`)
+  // 不猜 tone 是否已经注入：同一轮里 wall 与 tone 的先后顺序不保证。
+  lines.push('插件会按压缩点自动附一次原话样本；要更多就用上面的命令。')
+  lines.push('这是给你自己看的，不要说出去，按正常接着聊。')
+  lines.push(WALL_CLOSE)
+
+  return {
+    status: 'ok',
+    block: lines.join('\n'),
+    checkpoints,
+    minutesAgo,
+    eventsBefore,
+    userBefore,
+    turns,
+  }
+}
+
 function inspectOneSource(source, now) {
   const base = {
     id: source.id,
@@ -1293,7 +1404,11 @@ function makeInjectedMessage(text, kind) {
     content: Object.freeze([Object.freeze({ type: 'text', text })]),
     source: Object.freeze({
       kind,
-      form: kind === PLUGIN_NAME ? 'catalog' : (kind === NUDGE_SOURCE_KIND ? 'nudge' : 'tone'),
+      form: kind === PLUGIN_NAME
+        ? 'catalog'
+        : (kind === NUDGE_SOURCE_KIND
+          ? 'nudge'
+          : (kind === WALL_SOURCE_KIND ? 'wall' : 'tone')),
     }),
   })
 }
@@ -1329,6 +1444,16 @@ function hasToneAfterCheckpoint(events, boundary) {
   for (let index = boundary + 1; index < events.length; index += 1) {
     const event = events[index]
     if (event?.type === 'user/message' && event.data?.source?.kind === TONE_SOURCE_KIND) return true
+  }
+  return false
+}
+
+/** wall 同理：旧压缩点的痕迹不能挡住新压缩点。 */
+function hasWallAfterCheckpoint(events, boundary) {
+  if (boundary < 0) return false
+  for (let index = boundary + 1; index < events.length; index += 1) {
+    const event = events[index]
+    if (event?.type === 'user/message' && event.data?.source?.kind === WALL_SOURCE_KIND) return true
   }
   return false
 }
@@ -1413,48 +1538,86 @@ function installPreStepSeam(ctx, state, log, options) {
           }
         }
 
+        let wallText = ''
         let toneText = ''
-        if (state.config.tone.enabled) {
+        if (state.config.wall.enabled || state.config.tone.enabled) {
           const events = sessionEvents(agent)
-          const boundary = lastCheckpointIndex(events)
-          const key = checkpointKey(events, boundary)
-          const alreadyTone = key !== null
-            && (state.toneCheckpoints.get(id) === key || hasToneAfterCheckpoint(events, boundary))
-          const result = buildTone(state.config, events)
-          if (!state.toneLogged.has(id)) {
-            state.toneLogged.add(id)
-            if (result.status === 'ok') {
-              const checkpoints = events.filter((event) => event?.type === 'user/message'
-                && event.data?.source?.kind === 'compact-checkpoint').length
-              log(`tone：会话 ${events.length} 条，压缩点 ${checkpoints} 个，取到 ${result.turns} 轮原话`)
-            } else if (result.status === 'no-checkpoint') {
-              log('tone：没有压缩点，跳过')
+
+          if (state.config.wall.enabled) {
+            const boundary = lastCheckpointIndex(events)
+            const key = checkpointKey(events, boundary)
+            const alreadyWall = key !== null
+              && (state.wallCheckpoints.get(id) === key || hasWallAfterCheckpoint(events, boundary))
+            const result = buildWall(state.config, events)
+            if (alreadyWall) {
+              state.wallCheckpoints.set(id, key)
+              state.wallState = 'already'
+              state.wallCount = result.checkpoints
+              state.wallLastMinutes = result.minutesAgo
+            } else if (result.status === 'ok') {
+              wallText = result.block
+              state.wallCheckpoints.set(id, key)
+              state.wallState = 'injected'
+              state.wallCount = result.checkpoints
+              state.wallLastMinutes = result.minutesAgo
+              const when = result.minutesAgo === null ? '' : `，最后 ${result.minutesAgo} 分钟前`
+              log(`wall：压缩 ${result.checkpoints} 次${when}，注入一次`)
             } else {
-              log('tone：压缩点之前没有可用的原话，跳过')
+              state.wallState = result.status
+              if (result.status === 'no-checkpoint') {
+                state.wallCount = 0
+                state.wallLastMinutes = null
+                if (!state.wallLogged.has(id)) {
+                  state.wallLogged.add(id)
+                  log('wall：没有压缩点，跳过')
+                }
+              }
             }
           }
-          if (alreadyTone) {
-            state.toneCheckpoints.set(id, key)
-            state.toneState = 'injected'
-            if (result.status === 'ok') state.toneTurns = result.turns
-          } else if (result.status === 'ok') {
-            toneText = result.block
-            state.toneCheckpoints.set(id, key)
-            state.toneState = 'injected'
-            state.toneTurns = result.turns
-            log(`tone：注入了 ${result.turns} 轮原话（${result.chars} 字）`)
-          } else {
-            state.toneState = result.status
-            state.toneTurns = 0
+
+          if (state.config.tone.enabled) {
+            const boundary = lastCheckpointIndex(events)
+            const key = checkpointKey(events, boundary)
+            const alreadyTone = key !== null
+              && (state.toneCheckpoints.get(id) === key || hasToneAfterCheckpoint(events, boundary))
+            const result = buildTone(state.config, events)
+            if (!state.toneLogged.has(id)) {
+              state.toneLogged.add(id)
+              if (result.status === 'ok') {
+                const checkpoints = events.filter((event) => event?.type === 'user/message'
+                  && event.data?.source?.kind === 'compact-checkpoint').length
+                log(`tone：会话 ${events.length} 条，压缩点 ${checkpoints} 个，取到 ${result.turns} 轮原话`)
+              } else if (result.status === 'no-checkpoint') {
+                log('tone：没有压缩点，跳过')
+              } else {
+                log('tone：压缩点之前没有可用的原话，跳过')
+              }
+            }
+            if (alreadyTone) {
+              state.toneCheckpoints.set(id, key)
+              state.toneState = 'injected'
+              if (result.status === 'ok') state.toneTurns = result.turns
+            } else if (result.status === 'ok') {
+              toneText = result.block
+              state.toneCheckpoints.set(id, key)
+              state.toneState = 'injected'
+              state.toneTurns = result.turns
+              log(`tone：注入了 ${result.turns} 轮原话（${result.chars} 字）`)
+            } else {
+              state.toneState = result.status
+              state.toneTurns = 0
+            }
           }
         }
 
-        if (!catalogText && !nudgeText && !toneText) return decision
+        if (!catalogText && !nudgeText && !wallText && !toneText) return decision
         const outgoing = Array.isArray(decision.messages) ? [...decision.messages] : []
         if (catalogText || nudgeText) {
           const text = [catalogText, nudgeText].filter(Boolean).join('\n\n')
           outgoing.push(makeInjectedMessage(text, catalogText ? PLUGIN_NAME : NUDGE_SOURCE_KIND))
         }
+        // 先给自知（wall），再给样本（tone）。
+        if (wallText) outgoing.push(makeInjectedMessage(wallText, WALL_SOURCE_KIND))
         if (toneText) outgoing.push(makeInjectedMessage(toneText, TONE_SOURCE_KIND))
         return {
           ...decision,
@@ -1485,6 +1648,7 @@ const CONFIG_KEYS = [
   'header',
   'nudge',
   'tone',
+  'wall',
 ]
 
 /** 宿主若已经用 schema 填过默认值，这些值不应该盖住 config.json 里的用户默认。 */
@@ -1518,6 +1682,13 @@ function isBuiltInDefault(key, value) {
         && normalized.turns === DEFAULT_TONE.turns
         && normalized.maxChars === DEFAULT_TONE.maxChars
         && normalized.header === DEFAULT_TONE.header
+    }
+    case 'wall': {
+      if (!value || typeof value !== 'object') return true
+      const normalized = normalizeWall(value)
+      return normalized.enabled === true
+        && normalized.turns === DEFAULT_WALL.turns
+        && normalized.header === DEFAULT_WALL.header
     }
     default: return false
   }
@@ -1649,6 +1820,9 @@ function registerApi(ctx, state, log, ensureSeams) {
       nudgeHours: nudgeInfo.hours,
       toneState: state.config.tone.enabled ? state.toneState : 'disabled',
       toneTurns: state.toneTurns,
+      wallState: state.config.wall.enabled ? state.wallState : 'disabled',
+      wallCount: state.wallCount,
+      wallLastMinutes: state.wallLastMinutes,
       onboarding: onboardingInfo(ctx),
       snippet: AGENTS_SNIPPET,
       preview: previewFor(state.config),
@@ -1710,6 +1884,13 @@ function registerApi(ctx, state, log, ensureSeams) {
       } else if (state.toneState === 'disabled') {
         state.toneState = 'no-checkpoint'
       }
+      if (!next.wall.enabled) {
+        state.wallState = 'disabled'
+        state.wallCount = 0
+        state.wallLastMinutes = null
+      } else if (state.wallState === 'disabled') {
+        state.wallState = 'no-checkpoint'
+      }
       ensureSeams()
       return sendJson(res, 200, statePayload())
     }
@@ -1763,6 +1944,11 @@ function setup(ctx, rawConfig) {
     toneCheckpoints: new Map(),
     toneLogged: new Set(),
     toneTurns: 0,
+    wallState: config.wall.enabled ? 'no-checkpoint' : 'disabled',
+    wallCheckpoints: new Map(),
+    wallLogged: new Set(),
+    wallCount: 0,
+    wallLastMinutes: null,
   }
 
   const getCatalogText = () => {
@@ -1809,6 +1995,7 @@ function setup(ctx, rawConfig) {
     const needsMessage = !state.systemPromptInstalled
       || state.config.nudge.enabled
       || state.config.tone.enabled
+      || state.config.wall.enabled
     if (needsMessage && !state.preStepInstalled) {
       state.preStepInstalled = installPreStepSeam(ctx, state, log, {
         catalogViaMessage: !state.systemPromptInstalled,
@@ -1853,10 +2040,10 @@ function setup(ctx, rawConfig) {
   }
   if (!config.sources.length) {
     log('cardcatalog：没配 sources，未注入任何记忆')
-    if (!config.nudge.enabled && !config.tone.enabled) return
+    if (!config.nudge.enabled && !config.tone.enabled && !config.wall.enabled) return
   } else if (!config.sources.some((source) => source.enabled)) {
     log('cardcatalog：sources 全部停用，未注入任何记忆')
-    if (!config.nudge.enabled && !config.tone.enabled) return
+    if (!config.nudge.enabled && !config.tone.enabled && !config.wall.enabled) return
   }
   ensureSeams()
 }

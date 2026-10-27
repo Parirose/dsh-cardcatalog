@@ -1,7 +1,7 @@
 {
   "name": "dsh-cardcatalog",
-  "version": "0.4.1",
-  "description": "目录卡：把用户自己维护的记忆账本投影成标题级上下文，可选 markdown 小节、只读近况提醒与压缩后原话样本。只读、不存储、不检索。",
+  "version": "0.5.0",
+  "description": "目录卡：把用户自己维护的记忆账本投影成标题级上下文，可选 markdown 小节、只读近况提醒、压缩后原话样本与压缩痕迹提示。只读、不存储、不检索。",
   "displayName": "目录卡",
   "type": "module",
   "main": "index.js",
@@ -24,7 +24,7 @@
     "dsh": ">=0.1.7-rc.2 || >=0.2.0-rc.2"
   },
   "scripts": {
-    "test": "node --test test/cardcatalog.test.mjs test/host.test.mjs test/client.test.mjs test/v020.test.mjs test/v030.test.mjs test/v040.test.mjs",
+    "test": "node --test test/cardcatalog.test.mjs test/host.test.mjs test/client.test.mjs test/v020.test.mjs test/v030.test.mjs test/v040.test.mjs test/v050.test.mjs",
     "check:privacy": "node ci/check-privacy.mjs",
     "check:readonly": "node ci/check-readonly.mjs",
     "check:schema": "node ci/check-schema.mjs",

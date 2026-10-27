@@ -135,6 +135,9 @@ test('T12 nudge：未过期不注入；10 小时前注入且小时/最后一行�
     },
   }
   try {
+    // cpSync 会保留 fixture 的 mtime；先显式设成“刚刚”，否则用例会随检出时间变旧。
+    const justNow = new Date(now)
+    utimesSync(file, justNow, justNow)
     const fresh = buildNudge(config, { now })
     assert.equal(fresh, null)
 
