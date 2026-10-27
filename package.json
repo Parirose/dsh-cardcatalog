@@ -1,6 +1,6 @@
 {
   "name": "dsh-cardcatalog",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "目录卡：把用户自己维护的记忆账本投影成标题级上下文，可选 markdown 小节、只读近况提醒、压缩后原话样本与压缩痕迹提示。只读、不存储、不检索。",
   "displayName": "目录卡",
   "type": "module",

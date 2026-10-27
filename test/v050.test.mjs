@@ -6,7 +6,10 @@ import { fileURLToPath } from 'node:url'
 import {
   apply,
   buildWall,
+  DEFAULTS,
+  DEFAULT_WALL,
   DEFAULT_WALL_HEADER,
+  mergeConfigLayers,
   TONE_SOURCE_KIND,
   WALL_OPEN,
   WALL_SOURCE_KIND,
@@ -260,4 +263,23 @@ test('W7 wall 在 tone 之前', async () => {
   assert.equal(decision.messages[1].source.kind, TONE_SOURCE_KIND)
   assert.ok(decision.messages[0].content[0].text.startsWith(WALL_OPEN))
   assert.ok(decision.messages[1].content[0].text.includes('【用户】'))
+})
+
+test('W8 wall 三处同步：默认层、保存键、内置默认判断', () => {
+  assert.equal(DEFAULTS.wall.enabled, DEFAULT_WALL.enabled)
+  assert.equal(DEFAULTS.wall.turns, DEFAULT_WALL.turns)
+  assert.equal(DEFAULTS.wall.header, DEFAULT_WALL_HEADER)
+
+  // CONFIG_KEYS 漏 wall -> 文件层的 wall 会被 schema 默认值盖掉；
+  // isBuiltInDefault 漏 wall -> 同样不会回退到文件层。
+  const fileConfig = {
+    wall: { enabled: false, turns: 1, header: '自定义痕迹' },
+  }
+  const schemaDefaults = {
+    wall: { enabled: true, turns: 2, header: DEFAULT_WALL_HEADER },
+  }
+  const merged = mergeConfigLayers(fileConfig, schemaDefaults, false)
+  assert.equal(merged.wall.enabled, false)
+  assert.equal(merged.wall.turns, 1)
+  assert.equal(merged.wall.header, '自定义痕迹')
 })

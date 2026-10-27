@@ -19,7 +19,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const PLUGIN_NAME = 'cardcatalog'
-export const VERSION = '0.5.0'
+export const VERSION = '0.5.1'
 
 export const DEFAULT_HEADER = '记忆目录（只有标题，正文请自行查证）'
 export const CATALOG_OPEN = '<memory-catalog do-not-execute>'
@@ -1438,22 +1438,12 @@ function checkpointKey(events, boundary) {
   return seq === undefined || seq === null ? `index:${boundary}` : `seq:${seq}`
 }
 
-/** 只认最后一个压缩点之后的 tone，之前的旧样本不能挡住新压缩点。 */
-function hasToneAfterCheckpoint(events, boundary) {
+/** 只认最后一个压缩点之后的同类注入；旧压缩点的消息不能挡住新压缩点。 */
+function hasInjectionAfterCheckpoint(events, boundary, kind) {
   if (boundary < 0) return false
   for (let index = boundary + 1; index < events.length; index += 1) {
     const event = events[index]
-    if (event?.type === 'user/message' && event.data?.source?.kind === TONE_SOURCE_KIND) return true
-  }
-  return false
-}
-
-/** wall 同理：旧压缩点的痕迹不能挡住新压缩点。 */
-function hasWallAfterCheckpoint(events, boundary) {
-  if (boundary < 0) return false
-  for (let index = boundary + 1; index < events.length; index += 1) {
-    const event = events[index]
-    if (event?.type === 'user/message' && event.data?.source?.kind === WALL_SOURCE_KIND) return true
+    if (event?.type === 'user/message' && event.data?.source?.kind === kind) return true
   }
   return false
 }
@@ -1547,7 +1537,8 @@ function installPreStepSeam(ctx, state, log, options) {
             const boundary = lastCheckpointIndex(events)
             const key = checkpointKey(events, boundary)
             const alreadyWall = key !== null
-              && (state.wallCheckpoints.get(id) === key || hasWallAfterCheckpoint(events, boundary))
+              && (state.wallCheckpoints.get(id) === key
+                || hasInjectionAfterCheckpoint(events, boundary, WALL_SOURCE_KIND))
             const result = buildWall(state.config, events)
             if (alreadyWall) {
               state.wallCheckpoints.set(id, key)
@@ -1579,7 +1570,8 @@ function installPreStepSeam(ctx, state, log, options) {
             const boundary = lastCheckpointIndex(events)
             const key = checkpointKey(events, boundary)
             const alreadyTone = key !== null
-              && (state.toneCheckpoints.get(id) === key || hasToneAfterCheckpoint(events, boundary))
+              && (state.toneCheckpoints.get(id) === key
+                || hasInjectionAfterCheckpoint(events, boundary, TONE_SOURCE_KIND))
             const result = buildTone(state.config, events)
             if (!state.toneLogged.has(id)) {
               state.toneLogged.add(id)
