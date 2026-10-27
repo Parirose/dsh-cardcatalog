@@ -1,7 +1,7 @@
 {
   "name": "dsh-cardcatalog",
-  "version": "0.1.2",
-  "description": "目录卡：把用户自己维护的记忆账本投影成标题级上下文。只读、不存储、不检索。",
+  "version": "0.2.0",
+  "description": "目录卡：把用户自己维护的记忆账本投影成标题级上下文，可选 markdown 小节与只读近况提醒。只读、不存储、不检索。",
   "displayName": "目录卡",
   "type": "module",
   "main": "index.js",
@@ -24,7 +24,7 @@
     "dsh": ">=0.1.7-rc.2 || >=0.2.0-rc.2"
   },
   "scripts": {
-    "test": "node --test test/cardcatalog.test.mjs test/host.test.mjs test/client.test.mjs",
+    "test": "node --test test/cardcatalog.test.mjs test/host.test.mjs test/client.test.mjs test/v020.test.mjs",
     "check:privacy": "node ci/check-privacy.mjs",
     "check:readonly": "node ci/check-readonly.mjs",
     "check": "npm test && npm run check:privacy && npm run check:readonly"
@@ -56,6 +56,8 @@
     "deepseek-harness",
     "memory",
     "catalog",
+    "markdown",
+    "nudge",
     "read-only"
   ],
   "license": "MIT"

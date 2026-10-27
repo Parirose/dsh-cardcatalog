@@ -2,8 +2,8 @@
 /**
  * 只读断言：源码里不允许出现对账本路径的写 API。
  *
- * 这里不判断“写的是哪条路径”——只要出现这些 API 就红。测试里删临时 fixture
- * 用的是 unlinkSync，不在名单内。
+ * 这里不判断“写的是哪条路径”——只要出现这些 API 就红。markdown / nudge 的实现
+ * 也在同一扫描范围内；测试里删临时 fixture 用的是 unlinkSync，不在名单内。
  */
 import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
@@ -20,6 +20,9 @@ const NAMES = [
   'createWrite' + 'Stream',
   'mk' + 'dir',
   'r' + 'm',
+  'ren' + 'ame',
+  'copy' + 'File',
+  'trun' + 'cate',
 ]
 const FORBIDDEN = new RegExp('\\b(?:' + NAMES.join('|') + ')(?:Sync)?\\b')
 

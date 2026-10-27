@@ -20,6 +20,31 @@
       var h = React.createElement
       var API = '/api/cardcatalog'
 
+      var SOURCES_TEMPLATE = JSON.stringify([
+        {
+          id: 'env-facts',
+          kind: 'facts',
+          path: '~/.dsh/notes/facts.json',
+        },
+        {
+          id: 'reading-log',
+          kind: 'jsonl',
+          path: '~/.dsh/notes/log.jsonl',
+          idField: 'key',
+          titleField: 'title',
+          dateField: 'at',
+        },
+        {
+          id: 'notes',
+          kind: 'markdown',
+          path: '~/.dsh/notes/notes.md',
+          sections: ['称呼与偏好', '当前在做什么'],
+          maxChars: 700,
+        },
+      ], null, 2)
+
+      var NUDGE_PLACEHOLDER = '「{file}」最后更新在 {hours} 小时前（{lastLine}）。如果这一轮有新进展，结尾补一行。'
+
       function asJson(res) {
         if (res.ok) return res.json()
         throw new Error('HTTP ' + res.status)
@@ -39,7 +64,7 @@
       }
 
       var CSS = [
-        '[data-cc-page]{display:flex;flex-direction:column;gap:16px;padding:2px 2px 10px;max-width:680px;}',
+        '[data-cc-page]{display:flex;flex-direction:column;gap:16px;padding:2px 2px 10px;max-width:720px;}',
         '[data-cc-sec]{display:flex;flex-direction:column;gap:8px;}',
         '[data-cc-h]{font-size:11px;font-weight:600;letter-spacing:.04em;color:var(--dsw-alias-label-tertiary,#9aa0a6);}',
         '[data-cc-note]{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,#9aa0a6);}',
@@ -61,7 +86,7 @@
         'background:var(--dsw-alias-bg-overlay,rgba(128,128,128,.12));color:var(--dsw-alias-label-tertiary,#9aa0a6);}',
         '[data-cc-msg][data-warn]{color:#f59e0b;}',
         '[data-cc-msg][data-good]{color:#22c55e;}',
-        '[data-cc-pre]{margin:6px 0 0;padding:9px 10px;border-radius:8px;max-height:230px;overflow:auto;font-size:11px;',
+        '[data-cc-pre]{margin:6px 0 0;padding:9px 10px;border-radius:8px;max-height:260px;overflow:auto;font-size:11px;',
         'line-height:16px;white-space:pre-wrap;word-break:break-word;',
         'background:var(--dsw-alias-bg-overlay,rgba(0,0,0,.25));color:var(--dsw-alias-label-secondary,#c9ccd1);}',
         '[data-cc-sw]{flex:none;width:38px;height:22px;border-radius:11px;border:0;cursor:pointer;position:relative;',
@@ -71,6 +96,14 @@
         'transition:left .15s;display:block;}',
         '[data-cc-sw][data-on] i{left:19px;}',
         '[data-cc-kv]{font-size:11px;line-height:18px;color:var(--dsw-alias-label-tertiary,#9aa0a6);word-break:break-word;}',
+        '[data-cc-src]{padding:8px 10px;border-radius:8px;display:flex;flex-direction:column;gap:4px;',
+        'background:var(--dsw-alias-bg-overlay,rgba(128,128,128,.10));}',
+        '[data-cc-badge]{font-size:10px;padding:1px 6px;border-radius:9px;background:rgba(128,128,128,.22);}',
+        '[data-cc-badge][data-status="ok"]{color:#22c55e;}',
+        '[data-cc-badge][data-status="missing"],[data-cc-badge][data-status="error"]{color:#ef4444;}',
+        '[data-cc-badge][data-status="empty"],[data-cc-badge][data-status="stale"]{color:#f59e0b;}',
+        '[data-cc-steps]{margin:0;padding-left:18px;font-size:12px;line-height:20px;}',
+        '[data-cc-mono]{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;}',
       ].join('')
 
       function Switch(props) {
@@ -107,6 +140,50 @@
         return parsed
       }
 
+      function fmtTime(value) {
+        if (!value) return '—'
+        try {
+          return new Date(value).toLocaleString('zh-CN', { hour12: false })
+        } catch {
+          return '—'
+        }
+      }
+
+      function fmtBytes(value) {
+        var n = Number(value) || 0
+        if (n < 1024) return n + ' B'
+        return (n / 1024).toFixed(1) + ' KB'
+      }
+
+      function statusLabel(status) {
+        if (status === 'ok') return 'ok'
+        if (status === 'missing') return 'missing'
+        if (status === 'empty') return 'empty'
+        if (status === 'error') return 'error'
+        if (status === 'stale') return 'stale'
+        if (status === 'disabled') return '未启用'
+        return status || '未知'
+      }
+
+      function SourceCard(props) {
+        var source = props.source || {}
+        return h('div', { 'data-cc-src': '' },
+          h('div', { 'data-cc-row': '' },
+            h('span', { 'data-cc-label': '' }, source.id || '(no-id)'),
+            h('span', { 'data-cc-note': '' }, source.kind || ''),
+            h('span', {
+              'data-cc-badge': '',
+              'data-status': source.status || '',
+            }, statusLabel(source.status)),
+            source.enabled === false ? h('span', { 'data-cc-note': '' }, '已停用') : null),
+          h('div', { 'data-cc-kv': '' }, '路径：' + (source.path || '（未配置）')),
+          h('div', { 'data-cc-kv': '' },
+            '大小/行数：' + fmtBytes(source.bytes) + ' · ' + (source.lines || 0) + ' 行 · 条目 ' + (source.entries || 0),
+            h('br'),
+            '最后修改：' + fmtTime(source.mtime),
+            source.reason ? h('span', {}, ' · ' + source.reason) : null))
+      }
+
       function Panel() {
         var stateHook = React.useState(null)
         var state = stateHook[0]
@@ -126,12 +203,16 @@
         var msgHook = React.useState(null)
         var msg = msgHook[0]
         var setMsg = msgHook[1]
+        var copiedHook = React.useState('')
+        var copied = copiedHook[0]
+        var setCopied = copiedHook[1]
 
         function adopt(payload) {
           if (!payload || !payload.config) return
           setState(payload)
           setDraft(payload.config)
-          setSourcesText(JSON.stringify(payload.config.sources || [], null, 2))
+          var list = payload.config.sources || []
+          setSourcesText(list.length ? JSON.stringify(list, null, 2) : SOURCES_TEMPLATE)
           if (payload.preview) setPreview(payload.preview)
         }
 
@@ -155,6 +236,7 @@
             throw new Error('sources JSON 不合法：' + (error && error.message ? error.message : '解析失败'))
           }
           var base = draft || {}
+          var nudge = base.nudge || {}
           return {
             enabled: base.enabled !== false,
             sources: sources,
@@ -163,10 +245,18 @@
             maxLines: Number(base.maxLines) || 0,
             maxLinesPerSource: Number(base.maxLinesPerSource) || 0,
             staleMaxLines: Number(base.staleMaxLines) || 0,
-            maxChars: Number(base.maxChars) || 0,
+            maxChars: base.maxChars === 0 ? 0 : (Number(base.maxChars) || 1600),
             lineMaxChars: Number(base.lineMaxChars) || 80,
             showStale: base.showStale !== false,
             header: typeof base.header === 'string' ? base.header : '',
+            nudge: {
+              enabled: nudge.enabled === true,
+              file: typeof nudge.file === 'string' ? nudge.file : '',
+              staleAfterHours: Number(nudge.staleAfterHours) >= 0 ? Number(nudge.staleAfterHours) : 6,
+              text: typeof nudge.text === 'string' ? nudge.text : '',
+              maxChars: nudge.maxChars === 0 ? 0 : (Number(nudge.maxChars) || 200),
+              alsoEveryNTurns: Number(nudge.alsoEveryNTurns) || 0,
+            },
           }
         }
 
@@ -181,6 +271,7 @@
           setBusy('preview')
           jpost('/preview', { config: config }).then(function (payload) {
             if (payload && payload.preview) setPreview(payload.preview)
+            if (payload && payload.sources) setState(Object.assign({}, state, { sources: payload.sources, nudge: payload.nudge }))
             setMsg({ tone: payload && payload.preview && payload.preview.lines ? 'good' : 'warn', text: '预览已更新（不写入任何东西）。' })
           }).catch(function () {
             setMsg({ tone: 'warn', text: '预览失败：接口没有返回结果。' })
@@ -204,6 +295,33 @@
           }).finally(function () { setBusy('') })
         }
 
+        function copySnippet() {
+          var text = (state && state.snippet) || ''
+          if (!text) return
+          function done() { setCopied('已复制') }
+          function fail() { setCopied('复制失败，请手动选中') }
+          try {
+            if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(text).then(done).catch(fail)
+              return
+            }
+          } catch {
+            // 退回手动选择。
+          }
+          try {
+            var area = document.createElement('textarea')
+            area.value = text
+            area.setAttribute('readonly', '')
+            document.body.appendChild(area)
+            area.select()
+            document.execCommand('copy')
+            document.body.removeChild(area)
+            done()
+          } catch {
+            fail()
+          }
+        }
+
         if (!state || !draft) {
           return h('div', { 'data-cc-page': '' },
             h('div', { 'data-cc-msg': '' }, busy === 'load' ? '读取设置中…' : '还没有读到设置。'),
@@ -212,16 +330,23 @@
         }
 
         var writable = state.settingsAvailable !== false
+        var sources = state.sources || []
+        var onboarding = state.onboarding || {}
+        var nudge = draft.nudge || {}
+        var nudgeState = state.nudge || {}
+        var hasSources = (draft.sources || []).length > 0
 
         return h('div', { 'data-cc-page': '' },
           h('div', { 'data-cc-sec': '' },
             h('div', { 'data-cc-h': '' }, '目录卡'),
             h('div', { 'data-cc-note': '' },
-              '它只读你的账本，把标题投影成上下文；不存储、不检索、不写任何文件。',
+              '它只读你的账本，把标题和用户点名的小节投影成上下文；不存储、不检索、不写任何文件。',
               h('br'),
               '这里保存的是「怎么投影」的配置，不是记忆本身。'),
             h('div', { 'data-cc-kv': '' },
               '注入接缝：' + (state.seam === 'none' ? '当前不可用' : state.seam),
+              h('br'),
+              'nudge 接缝：' + (state.nudgeSeam === 'none' ? '未启用或不可用' : state.nudgeSeam),
               h('br'),
               '配置文件：' + state.configPath),
             h('div', { 'data-cc-row': '' },
@@ -233,22 +358,122 @@
               }),
               h('span', { 'data-cc-note': '' }, '关掉后整段不注入'))),
 
+          !hasSources
+            ? h('div', { 'data-cc-sec': '' },
+              h('div', { 'data-cc-h': '' }, '还没有配 sources：三步开始'),
+              h('ol', { 'data-cc-steps': '' },
+                h('li', {}, '选一个文件：支持 JSON 数组（facts）、JSONL、Markdown。'),
+                h('li', {}, '在下面的 JSON 框里填 sources；框里已经放了一个可编辑的模板。'),
+                h('li', {}, '把下面「给模型的说明书」复制到你的 AGENTS.md。')),
+              h('div', { 'data-cc-note': '' },
+                '当前工作区 AGENTS.md：' + (onboarding.agentsPath || '（未知）'),
+                h('br'),
+                onboarding.agentsExists
+                  ? ('已存在 · ' + fmtBytes(onboarding.agentsBytes) + '（只显示，不写入）')
+                  : '还不存在（插件不会创建它；需要你自己建）'))
+            : null,
+
+          h('div', { 'data-cc-sec': '' },
+            h('div', { 'data-cc-h': '' }, '来源状态'),
+            sources.length
+              ? sources.map(function (source) { return h(SourceCard, { key: source.id + source.kind, source: source }) })
+              : h('div', { 'data-cc-note': '' }, '还没有来源。配好 sources 后这里会显示每个文件的读取状态。')),
+
           h('div', { 'data-cc-sec': '' },
             h('div', { 'data-cc-h': '' }, '账本来源（sources）'),
             h('textarea', {
               'data-cc-input': '',
-              rows: 10,
+              rows: 12,
               spellCheck: false,
               value: sourcesText,
               onChange: function (event) { setSourcesText(event.target.value) },
               placeholder: '[]',
             }),
+            h('div', { 'data-cc-row': '' },
+              h('button', {
+                'data-cc-btn': '',
+                disabled: !writable,
+                onClick: function () { setSourcesText(SOURCES_TEMPLATE) },
+              }, '填入模板'),
+              h('span', { 'data-cc-note': '' }, '模板是假路径，保存前请换成你自己的只读文件。')),
             h('div', { 'data-cc-note': '' },
               'JSON 数组。每项至少要有 id、kind、path；path 支持 ~ 和环境变量。',
               h('br'),
-              '不配 sources ⇒ 什么都不注入。')),
-          h('div', { 'data-cc-note': '' },
-            'path 示例：~/.dsh/notes/facts.json（这里只是示例，不会替你创建文件）。'),
+              'markdown 源用 sections 或 tailLines 取正文，maxChars 是单源硬上限。',
+              h('br'),
+              '不配 sources ⇒ 目录什么都不注入。')),
+
+          h('div', { 'data-cc-sec': '' },
+            h('div', { 'data-cc-h': '' }, 'nudge：提醒，不代写'),
+            h('div', { 'data-cc-row': '' },
+              h('span', { 'data-cc-label': '' }, '启用 nudge'),
+              h(Switch, {
+                on: nudge.enabled === true,
+                disabled: !writable,
+                onChange: function (value) { setDraft(Object.assign({}, draft, { nudge: Object.assign({}, nudge, { enabled: value }) })) },
+              }),
+              h('span', { 'data-cc-note': '' }, '只提醒文件多久没更新；不写入、不总结')),
+            h('label', { 'data-cc-sec': '' },
+              h('span', { 'data-cc-label': '' }, '近况文件'),
+              h('input', {
+                'data-cc-input': '',
+                value: nudge.file || '',
+                disabled: !writable,
+                placeholder: '~/.dsh/notes/now.md',
+                onChange: function (event) {
+                  setDraft(Object.assign({}, draft, { nudge: Object.assign({}, nudge, { file: event.target.value }) }))
+                },
+              })),
+            h('div', { 'data-cc-grid': '' },
+              h(NumberField, {
+                label: 'staleAfterHours',
+                value: nudge.staleAfterHours,
+                min: 0,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { nudge: Object.assign({}, nudge, { staleAfterHours: Number(value) || 0 }) }))
+                },
+              }),
+              h(NumberField, {
+                label: 'nudge maxChars',
+                value: nudge.maxChars,
+                min: 0,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { nudge: Object.assign({}, nudge, { maxChars: Number(value) || 0 }) }))
+                },
+              }),
+              h(NumberField, {
+                label: 'alsoEveryNTurns',
+                value: nudge.alsoEveryNTurns,
+                min: 0,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { nudge: Object.assign({}, nudge, { alsoEveryNTurns: Number(value) || 0 }) }))
+                },
+                note: '0 = 只首轮',
+              })),
+            h('label', { 'data-cc-sec': '' },
+              h('span', { 'data-cc-label': '' }, '提醒文案'),
+              h('textarea', {
+                'data-cc-input': '',
+                rows: 3,
+                value: nudge.text || '',
+                disabled: !writable,
+                placeholder: NUDGE_PLACEHOLDER,
+                onChange: function (event) {
+                  setDraft(Object.assign({}, draft, { nudge: Object.assign({}, nudge, { text: event.target.value }) }))
+                },
+              })),
+            h('div', { 'data-cc-note': '' },
+              '文案为空时 nudge 不生效。占位符：{file}、{hours}、{lastLine}。',
+              h('br'),
+              'nudge 文件状态：' + statusLabel(nudgeState.status)
+                + (nudgeState.reason ? ' · ' + nudgeState.reason : '')
+                + (nudgeState.hours !== null && nudgeState.hours !== undefined ? ' · ' + nudgeState.hours + ' 小时前' : '')),
+            nudge.enabled === true && !String(nudge.text || '').trim()
+              ? h('div', { 'data-cc-msg': '', 'data-warn': '' }, 'nudge 已开但没有文案，不会注入提醒。')
+              : null),
 
           h('div', { 'data-cc-sec': '' },
             h('div', { 'data-cc-h': '' }, '裁剪与时机'),
@@ -282,6 +507,7 @@
                 min: 0,
                 disabled: !writable,
                 onChange: function (value) { setDraft(Object.assign({}, draft, { maxChars: Number(value) || 0 })) },
+                note: '整段硬上限',
               }),
               h(NumberField, {
                 label: 'lineMaxChars',
@@ -334,11 +560,26 @@
           h('div', { 'data-cc-sec': '' },
             h('div', { 'data-cc-h': '' }, '注入预览'),
             h('div', { 'data-cc-note': '' },
-              preview ? ('将注入 ' + preview.lines + ' 行；读到 ' + preview.rowCount + ' 条。') : '还没有预览。'),
+              preview ? ('目录将注入 ' + preview.lines + ' 行；读到 ' + preview.rowCount + ' 条。') : '还没有预览。'),
             h('pre', { 'data-cc-pre': '' }, preview && preview.text ? preview.text : '（空：一行都取不到时整段不注入）'),
+            preview && preview.nudge && preview.nudge.block
+              ? h('pre', { 'data-cc-pre': '' }, preview.nudge.block)
+              : null,
             preview && preview.notes && preview.notes.length
               ? h('div', { 'data-cc-note': '' }, preview.notes.join(' / '))
               : null),
+
+          h('div', { 'data-cc-sec': '' },
+            h('div', { 'data-cc-h': '' }, '给模型的说明书（复制到 AGENTS.md）'),
+            h('div', { 'data-cc-note': '' },
+              'AGENTS.md：' + (onboarding.agentsPath || '（未知）') + ' · '
+                + (onboarding.agentsExists ? ('已存在 · ' + fmtBytes(onboarding.agentsBytes)) : '不存在'),
+              h('br'),
+              '插件不会创建或修改这个文件；这里只提供可复制的文本。'),
+            h('pre', { 'data-cc-pre': '' }, state.snippet || ''),
+            h('div', { 'data-cc-row': '' },
+              h('button', { 'data-cc-btn': '', onClick: copySnippet }, '复制片段'),
+              copied ? h('span', { 'data-cc-note': '' }, copied) : null)),
 
           !writable
             ? h('div', { 'data-cc-msg': '', 'data-warn': '' },

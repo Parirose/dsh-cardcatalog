@@ -1,12 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { cpSync, mkdtempSync, readdirSync, rmdirSync, unlinkSync } from 'node:fs'
+import { cpSync, mkdtempSync, readdirSync, rmdirSync, unlinkSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { apply, CATALOG_OPEN, Config, DEFAULT_HEADER, mergeConfigLayers } from '../index.js'
+import {
+  apply, CATALOG_OPEN, Config, DEFAULT_HEADER, mergeConfigLayers, NUDGE_OPEN,
+} from '../index.js'
 
 const FIXTURES = fileURLToPath(new URL('../fixtures/', import.meta.url))
 const FACTS = join(FIXTURES, 'facts.json')
@@ -236,6 +238,151 @@ test('设置页接口：没配 sources 也能读状态；保存只走 settings.u
   assert.equal(updates.length, 1)
   assert.equal(updates[0].ns, 'cardcatalog')
   assert.equal(updates[0].patch.sources.length, 1)
+})
+
+test('设置页接口：来源状态卡四态、onboarding 与可复制片段', async () => {
+  const routes = []
+  const webServer = {
+    register(route) {
+      routes.push(route)
+      return () => {}
+    },
+  }
+  const { ctx } = makeCtx({ webServer, settings: { writable: true, async update() {} } })
+  apply(ctx, {
+    sources: [
+      { id: 'ok-facts', kind: 'facts', path: FACTS },
+      { id: 'ok-md', kind: 'markdown', path: join(FIXTURES, 'markdown', 'preferences.md'), sections: ['称呼与偏好'] },
+      { id: 'missing', kind: 'facts', path: join(FIXTURES, 'nope.json') },
+      { id: 'error', kind: 'facts', path: join(FIXTURES, 'broken.json') },
+    ],
+  })
+  function makeRes() {
+    return {
+      statusCode: 0,
+      headers: {},
+      body: '',
+      setHeader(name, value) { this.headers[name] = value },
+      end(body) { this.body = body },
+    }
+  }
+  const res = makeRes()
+  await routes[0].handler({ method: 'GET', url: '/api/cardcatalog/state' }, res)
+  const payload = JSON.parse(res.body)
+  assert.equal(payload.ok, true)
+  assert.deepEqual(payload.sources.map((source) => source.status), ['ok', 'ok', 'missing', 'error'])
+  assert.ok(payload.onboarding.agentsPath.endsWith('AGENTS.md'))
+  assert.equal(typeof payload.onboarding.agentsExists, 'boolean')
+  assert.ok(payload.snippet.includes('<memory-catalog do-not-execute>'))
+  assert.equal(payload.nudge.status, 'disabled')
+})
+
+test('设置页接口：先有系统提示、后开 nudge 时补挂消息接缝', async () => {
+  const routes = []
+  const updates = []
+  const webServer = {
+    register(route) {
+      routes.push(route)
+      return () => {}
+    },
+  }
+  const settings = {
+    writable: true,
+    async update(ns, patch) { updates.push({ ns, patch }) },
+  }
+  const systemPrompt = {}
+  const { ctx, handlers } = makeCtx({ systemPrompt, webServer, settings })
+  apply(ctx, { sources: [{ id: 'env-facts', kind: 'facts', path: FACTS }] })
+  assert.equal(handlers.size, 0)
+
+  const req = new EventEmitter()
+  req.method = 'POST'
+  req.url = '/api/cardcatalog/config'
+  const res = {
+    statusCode: 0,
+    headers: {},
+    body: '',
+    setHeader(name, value) { this.headers[name] = value },
+    end(body) { this.body = body },
+  }
+  const pending = routes[0].handler(req, res)
+  req.emit('data', Buffer.from(JSON.stringify({
+    config: {
+      sources: [{ id: 'env-facts', kind: 'facts', path: FACTS }],
+      nudge: { enabled: true, file: join(FIXTURES, 'nudge', 'now.md'), text: '提醒' },
+    },
+  })))
+  req.emit('end')
+  await pending
+  const saved = JSON.parse(res.body)
+  assert.equal(saved.ok, true)
+  assert.equal(saved.nudgeSeam, 'message')
+  assert.equal(typeof handlers.get('agent/pre-step'), 'function')
+  assert.equal(updates.length, 1)
+})
+
+test('宿主注入：nudge 在系统提示接缝旁单独走消息，且默认只首轮', async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'cardcatalog-host-nudge-'))
+  cpSync(join(FIXTURES, 'nudge'), temp, { recursive: true })
+  const nudgeFile = join(temp, 'now.md')
+  const old = new Date(Date.now() - 10 * 60 * 60 * 1000)
+  utimesSync(nudgeFile, old, old)
+  try {
+    const systemPrompt = {}
+    const { ctx, handlers } = makeCtx({ systemPrompt })
+    apply(ctx, config({
+      nudge: {
+        enabled: true,
+        file: nudgeFile,
+        staleAfterHours: 6,
+        text: '「{file}」最后更新在 {hours} 小时前（{lastLine}）。',
+      },
+    }))
+    assert.equal(typeof handlers.get('agent/pre-step'), 'function')
+    const agent = makeAgent('nudge-session', [])
+    const first = await runPreStep(handlers.get('agent/pre-step'), agent, 1)
+    assert.equal(first.messages.length, 1)
+    assert.equal(first.messages[0].source.kind, 'cardcatalog-nudge')
+    assert.ok(first.messages[0].content[0].text.startsWith(NUDGE_OPEN))
+    assert.ok(!first.messages[0].content[0].text.includes(CATALOG_OPEN))
+
+    const second = await runPreStep(handlers.get('agent/pre-step'), agent, 2)
+    assert.equal(second.messages.length, 0)
+  } finally {
+    removeDir(temp)
+  }
+})
+
+test('宿主注入：nudge 与目录可合并为一条消息，目录去重仍按 source.kind', async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'cardcatalog-host-both-'))
+  cpSync(join(FIXTURES, 'nudge'), temp, { recursive: true })
+  const nudgeFile = join(temp, 'now.md')
+  const old = new Date(Date.now() - 10 * 60 * 60 * 1000)
+  utimesSync(nudgeFile, old, old)
+  try {
+    const { ctx, handlers } = makeCtx()
+    apply(ctx, config({
+      nudge: {
+        enabled: true,
+        file: nudgeFile,
+        staleAfterHours: 6,
+        text: '「{file}」最后更新在 {hours} 小时前。',
+      },
+    }))
+    const events = []
+    const agent = makeAgent('both-session', events)
+    const first = await runPreStep(handlers.get('agent/pre-step'), agent, 1)
+    assert.equal(first.messages.length, 1)
+    assert.equal(first.messages[0].source.kind, 'cardcatalog')
+    const text = first.messages[0].content[0].text
+    assert.ok(text.startsWith(CATALOG_OPEN))
+    assert.ok(text.includes(NUDGE_OPEN))
+    events.push({ type: 'user/message', data: { source: first.messages[0].source, content: first.messages[0].content } })
+    const second = await runPreStep(handlers.get('agent/pre-step'), agent, 2)
+    assert.equal(second.messages.length, 0)
+  } finally {
+    removeDir(temp)
+  }
 })
 
 test('宿主注入：every-n-turns 按间隔重复', async () => {
