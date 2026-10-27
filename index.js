@@ -18,7 +18,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const PLUGIN_NAME = 'cardcatalog'
-export const VERSION = '0.2.1'
+export const VERSION = '0.3.0'
 
 export const DEFAULT_HEADER = '记忆目录（只有标题，正文请自行查证）'
 export const CATALOG_OPEN = '<memory-catalog do-not-execute>'
@@ -147,10 +147,10 @@ export const Config = !schema ? undefined : (() => {
       nudge: schema.object({
         enabled: schema.boolean().default(false).description('是否启用近况提醒'),
         file: schema.string().default('').description('监听的近况文件；不存在就不注入'),
-        staleAfterHours: schema.number().min(0).default(6).description('超过多少小时没更新才提醒'),
+        staleAfterHours: schema.number().min(0).default(6).description('近况文件超过多少小时没更新才算"该提醒"'),
         text: schema.string().default('').description('提醒文案；为空时 nudge 不生效'),
         maxChars: schema.number().min(0).step(1).default(200).description('提醒整行字符上限'),
-        alsoEveryNTurns: schema.number().min(0).step(1).default(0).description('>0 时每 N 轮再提醒一次'),
+        alsoEveryNTurns: schema.number().min(0).step(1).default(0).description('每 N 轮再检查一次是否该提醒（0 = 只在会话第 1 轮检查）；是否真的提醒仍由 staleAfterHours 决定'),
       }).default({}).description('近况提醒；只提醒，不代写').extra('volatile', true),
     })
   } catch {
@@ -1411,20 +1411,27 @@ function registerApi(ctx, state, log, ensureSeams) {
     ? '$DSH_HOME/cardcatalog/config.json'
     : '~/.dsh/cardcatalog/config.json'
 
-  const statePayload = () => ({
-    ok: true,
-    version: VERSION,
-    seam: state.seam,
-    nudgeSeam: state.nudgeSeam,
-    settingsAvailable: settingsCanWrite(ctx),
-    configPath: configPathLabel,
-    config: state.config,
-    sources: inspectSources(state.config),
-    nudge: inspectNudge(state.config),
-    onboarding: onboardingInfo(ctx),
-    snippet: AGENTS_SNIPPET,
-    preview: previewFor(state.config),
-  })
+  const statePayload = () => {
+    // 只复用这一次 inspectNudge 的结果，不为“会不会触发”再读一遍文件。
+    const nudgeInfo = inspectNudge(state.config)
+    return {
+      ok: true,
+      version: VERSION,
+      seam: state.seam,
+      nudgeSeam: state.nudgeSeam,
+      settingsAvailable: settingsCanWrite(ctx),
+      configPath: configPathLabel,
+      config: state.config,
+      sources: inspectSources(state.config),
+      nudge: nudgeInfo,
+      // 没开、读不到文件、没有文案、或还没到 staleAfterHours，都必须是 false。
+      nudgeWillFire: state.config.nudge.enabled && nudgeInfo.stale === true && nudgeInfo.hasText,
+      nudgeHours: nudgeInfo.hours,
+      onboarding: onboardingInfo(ctx),
+      snippet: AGENTS_SNIPPET,
+      preview: previewFor(state.config),
+    }
+  }
 
   const handler = async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1')

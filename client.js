@@ -334,6 +334,15 @@
         var onboarding = state.onboarding || {}
         var nudge = draft.nudge || {}
         var nudgeState = state.nudge || {}
+        var nudgeWillFire = state.nudgeWillFire === true
+        var nudgeHours = state.nudgeHours
+        var staleHours = Number(nudge.staleAfterHours)
+        if (!Number.isFinite(staleHours)) staleHours = 6
+        var nudgeStatusLine = nudgeWillFire && nudgeHours !== null && nudgeHours !== undefined
+          ? ('近况文件已 ' + nudgeHours + ' 小时没更新：下一轮检查会提醒')
+          : (nudgeHours !== null && nudgeHours !== undefined
+            ? ('近况文件 ' + nudgeHours + ' 小时前更新过：还没到 ' + staleHours + ' 小时，暂不提醒')
+            : '读不到近况文件：不会提醒')
         var hasSources = (draft.sources || []).length > 0
 
         return h('div', { 'data-cc-page': '' },
@@ -444,14 +453,14 @@
                 },
               }),
               h(NumberField, {
-                label: 'alsoEveryNTurns',
+                label: '每 N 轮再检查一次',
                 value: nudge.alsoEveryNTurns,
                 min: 0,
                 disabled: !writable,
                 onChange: function (value) {
                   setDraft(Object.assign({}, draft, { nudge: Object.assign({}, nudge, { alsoEveryNTurns: Number(value) || 0 }) }))
                 },
-                note: '0 = 只首轮',
+                note: '两个数一起决定：文件超过 staleAfterHours 小时没更新，才会在检查的那一轮提醒。',
               })),
             h('label', { 'data-cc-sec': '' },
               h('span', { 'data-cc-label': '' }, '提醒文案'),
@@ -473,7 +482,8 @@
                 + (nudgeState.hours !== null && nudgeState.hours !== undefined ? ' · ' + nudgeState.hours + ' 小时前' : '')),
             nudge.enabled === true && !String(nudge.text || '').trim()
               ? h('div', { 'data-cc-msg': '', 'data-warn': '' }, 'nudge 已开但没有文案，不会注入提醒。')
-              : null),
+              : null,
+            h('div', { 'data-cc-note': '' }, nudgeStatusLine)),
 
           h('div', { 'data-cc-sec': '' },
             h('div', { 'data-cc-h': '' }, '裁剪与时机'),
