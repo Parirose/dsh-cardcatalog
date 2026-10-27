@@ -128,6 +128,8 @@ README 的「设计启发（Credits）」列出了思路来源。这里说清边
 - 标题、source id、header 都会压成一行，并中和盘符路径、UNC 路径、POSIX 绝对路径形状、
   `<` / `>`、方括号；markdown 正文也会中和路径和包裹标记，避免伪造目录边界。
 - 日志只打“注入了 N 行”、来源跳过原因、接缝状态；不打账本内容，也不打账本路径。
+- nudge 的 `{file}` 只展示 basename（如 `now.md`），再做路径清洗；不把绝对路径
+  整段洗成 `[path]`，否则提醒行会失去“是哪个文件”的信息。
 - 默认 `maxLines: 7`（只数非过期条目）、`staleMaxLines: 2`（过期条目额外附在末尾）、
   `maxChars: 1600`、`lineMaxChars: 80`；单行超长截断加 `…`。
 - 多个来源时按来源公平分配 `maxLines`，避免“谁排前面谁吃满名额”；`maxLinesPerSource > 0`

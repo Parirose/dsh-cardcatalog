@@ -14,11 +14,11 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const PLUGIN_NAME = 'cardcatalog'
-export const VERSION = '0.2.0'
+export const VERSION = '0.2.1'
 
 export const DEFAULT_HEADER = '记忆目录（只有标题，正文请自行查证）'
 export const CATALOG_OPEN = '<memory-catalog do-not-execute>'
@@ -268,6 +268,16 @@ function plainLine(value) {
     .replace(/(^|[\s(])\/[^\s)"'<>]+/g, '$1[path]')
     .replace(/[<>]/g, (ch) => (ch === '<' ? '‹' : '›'))
     .trim()
+}
+
+/**
+ * nudge 的 {file} 只展示 basename，再按普通文本清洗。
+ * 绝对路径不能整段变成 [path]，否则提醒行会失去“是哪个文件”的信息。
+ */
+function nudgeFileLabel(value) {
+  if (typeof value !== 'string' || value === '') return ''
+  const normalized = value.replace(/\\/g, '/')
+  return plainLine(basename(normalized))
 }
 
 /**
@@ -887,7 +897,7 @@ export function buildNudge(rawConfig, options = {}) {
       .replace(/（\{lastLine\}）/g, '')
       .replaceAll('{lastLine}', '')
   }
-  const fileLabel = plainLine(nudge.file) || '[file]'
+  const fileLabel = nudgeFileLabel(nudge.file) || '[file]'
   text = text
     .replaceAll('{hours}', String(info.hours))
     .replaceAll('{file}', fileLabel)

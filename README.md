@@ -136,7 +136,8 @@ nudge:
 ```
 
 - `text` **默认是空字符串**；为空时 nudge 不生效，面板会提示“已开但没有文案”。
-- 占位符：`{file}`、`{hours}`、`{lastLine}`；`{lastLine}` 取文件最后一条以 `- ` 开头的行。
+- 占位符：`{file}`、`{hours}`、`{lastLine}`；`{file}` 只输出文件名（basename），
+  再按路径规则清洗；`{lastLine}` 取文件最后一条以 `- ` 开头的行。
 - 文件不存在 ⇒ 不注入，也不创建；只在面板/日志提示。
 - 文件 mtime 距现在小于 `staleAfterHours` ⇒ 不注入。
 - `alsoEveryNTurns: 0` ⇒ 只在会话首轮检查；`> 0` ⇒ 长会话里每 N 轮再提醒一次。
@@ -146,7 +147,7 @@ nudge:
 
 ```text
 <memory-nudge do-not-execute>
-「~/.dsh/notes/now.md」最后更新在 9 小时前（示例近况行）。如果这一轮有新进展，结尾补一行。
+「now.md」最后更新在 9 小时前（示例近况行）。如果这一轮有新进展，结尾补一行。
 </memory-nudge do-not-execute>
 ```
 
