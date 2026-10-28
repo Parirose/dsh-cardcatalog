@@ -29,6 +29,11 @@ buildNudge()  ──►  可选的 <memory-nudge> 提醒段落
         │  （只读，不落盘）
         ▼
 buildTone() / buildWall()  ──►  <memory-tone> 原话样本 / <memory-wall> 压缩痕迹
+
+用户配置的 facts / jsonl / markdown
+        │  （只读）
+        ▼
+clarityOf() / redlineOf() / renderDecayLine()  ──►  面板计数 / 可选的 <memory-decay>
 ```
 
 整条链路没有写操作，没有数据库，没有索引，没有后台任务。
@@ -98,16 +103,17 @@ README 的「设计启发（Credits）」列出了思路来源。这里说清边
 3. **都没有**
    - 不注册任何东西，日志写明“当前宿主没有可用的注入接缝”。
 
-### nudge / tone / wall 的接缝
+### nudge / tone / wall / decay 的接缝
 
 `nudge` 需要知道“第几轮”，`tone` / `wall` 需要读取会话事件并只在每个压缩点首次出现时
-注入，所以它们都不能塞进稳定的系统提示 section。它们单独走 `agent/pre-step`：
+注入，`decay` 需要按天比较清晰度，所以它们都不能塞进稳定的系统提示 section。
+它们单独走 `agent/pre-step`：
 
-- 目录已经走系统提示时，仍然注册一个轻量的 pre-step，负责 nudge / tone / wall；
+- 目录已经走系统提示时，仍然注册一个轻量的 pre-step，负责 nudge / tone / wall / decay；
 - 目录也走消息时，目录与 nudge 可以合并成一条消息；
-- nudge / tone / wall 各自有独立的 `source.kind`（`cardcatalog-nudge` /
-  `cardcatalog-tone` / `cardcatalog-wall`），不会被 `sessionHasCatalog()` 误判成
-  “已经有目录”。
+- nudge / tone / wall / decay 各自有独立的 `source.kind`（`cardcatalog-nudge` /
+  `cardcatalog-tone` / `cardcatalog-wall` / `cardcatalog-decay`），不会被
+  `sessionHasCatalog()` 误判成“已经有目录”。
 
 ### 关于“token 只付一次”
 
@@ -137,6 +143,7 @@ README 的「设计启发（Credits）」列出了思路来源。这里说清边
   诊断日志只打事件数量、压缩点数量和轮次，不打原话内容。
 - wall 只注入压缩次数、多久以前、事件数、真人消息数和固定命令；不注入任何内容，
   日志也只打这些计数。
+- decay 只注入四档计数、源字节数/百分比和降档条数；不注入事实标题、正文或绝对路径。
 - 日志只打“注入了 N 行”、来源跳过原因、接缝状态；不打账本内容，也不打账本路径。
 - nudge 的 `{file}` 只展示 basename（如 `now.md`），再做路径清洗；不把绝对路径
   整段洗成 `[path]`，否则提醒行会失去“是哪个文件”的信息。
@@ -195,6 +202,10 @@ README 的「设计启发（Credits）」列出了思路来源。这里说清边
 - nudge 只检查 mtime，不判断内容质量；文件被 touch 过就会视为“更新过”。
 - wall 的计数只覆盖 `snapshotEvents()` 当前可见的事件；如果宿主已经丢掉更早的事件，
   它数不到，也不会声称数得到。压缩点没有 `time` 时省略“N 分钟前”，不估时间。
+- decay 的分布只覆盖当前能读到的 facts/jsonl；文件读不到就跳过该源，不猜条目。
+  没有 `verifiedAt` 的条目标 vivid + `no-date`，不会被偷偷当成“刚验证过”。
+- 红线只看文件字节数，不看内容质量；文件读不到大小时按 0 B 处理，面板的来源状态卡
+  会说明读取失败。
 
 ## 10. 测试策略
 
@@ -206,6 +217,8 @@ README 的「设计启发（Credits）」列出了思路来源。这里说清边
 - v0.4.0 新增 T1–T6：合成事件数组上的压缩点、原话提取、清洗、截断和每个压缩点只注入一次。
 - v0.5.0 新增 W1–W8：wall 的无压缩点、计数、去重、新压缩点、缺失时间、
   wall 与 tone 的先后顺序，以及 DEFAULTS / CONFIG_KEYS / isBuiltInDefault 三处同步。
+- v0.6.0 新增 D1–D8：清晰度四档、重要度封顶、命中回升、缺失日期、红线三态，
+  以及“无内容不注入 / 同日去重”的 pre-step 测试。
 - 宿主接缝测试用假 context：验证系统提示优先、消息接缝只注入一次、子会话跳过、
   `every-n-turns` 间隔，以及“系统提示目录 + 消息 nudge”的混合路径。
 - 隐私检查扫源码、文档、fixture；只读检查扫源码里的写 API。
@@ -266,7 +279,9 @@ README 的「设计启发（Credits）」列出了思路来源。这里说清边
 解析不到 schemastery 时明确打印 skipped，不静默通过。
 
 这里也留下一条规则：**只有对象级字段可标 volatile；子字段与 list 子项一律不标。**
-`nudge` / `wall` 一直遵守它，`tone` 曾经违反它，导致整个 `Config` 被宿主拒绝。
+`decay` 是对象级 volatile，`importanceByScope` 的 dict 子键不标；`sources[]` 也是
+对象级 volatile，新增的 `maxBytes` / `warnPct` 不标。`nudge` / `wall` / `decay` 都遵守它，
+`tone` 曾经违反它，导致整个 `Config` 被宿主拒绝。
 
 ## 16. 为什么 wall 只给指针，不给内容
 
@@ -285,3 +300,25 @@ README 的「设计启发（Credits）」列出了思路来源。这里说清边
   关掉后不再注入，也不清理已经注入过的。
 - **不猜 tone 的顺序。** 同一轮里 wall 与 tone 谁先谁后不保证，所以文案只说
   “插件会按压缩点自动附一次”，不说“样本已附在上面”。
+
+## 17. 为什么 decay 只算不存
+
+遗忘是渐进的，`ttlDays` 的“过期 / 没过期”二元判定不够用；但一旦把清晰度存下来，
+就会多出第二份状态，还要处理迁移、清理和“状态与账本不一致”。
+
+- **算出来的，不是存下来的。** `clarityOf()` 只吃 fact + config + hits + now，
+  同一份账本和同一个时间点必然得到同一个结果。进程重启不会改变它。
+- **重要度是纯函数。** `fact.importance` 优先；否则按 `scope` 查
+  `importanceByScope`；再否则用 `default`。不调模型、不做语义判断。
+- **软硬分开。** `ttlDays` 仍负责“该重新验证”（stale），clarity 只负责“还记得多清楚”。
+  一个事实可以既 stale 又 vivid；也可以没过期但已经 trace。两者不互相覆盖。
+- **命中回升的边界。** 按规范公式，最近一次命中既推进 `lastSeen`，又计入 `recover`；
+  所以 `recoverDays` 必须覆盖到“仍然足够老”的命中，回升才看得见。这是公式的结果，
+  不是另一套规则。
+- **`verifiedAt` 缺失不猜。** 没有日期就 vivid + `no-date`；宁可说“没有日期”，
+  也不编一个“大概三天前”。
+- **红线是每个源自己的事。** `maxBytes` / `warnPct` 放在 `sources[]` 里，和
+  `maxChars` / `maxLines` 同层；`pct` 只回答“离红线还有多远”，不判断内容质量。
+- **不搬、不写。** v0.6 只提示；归档改写属于 v0.7，且默认关、只对显式允许的源生效。
+- **按天去重。** `decayReportedDay` 只是进程内 Map；重启最多多报一两次，
+  不为此建状态文件。没有跨档也没有过线时，一个字都不注入。

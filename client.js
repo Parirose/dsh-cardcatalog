@@ -25,6 +25,8 @@
           id: 'env-facts',
           kind: 'facts',
           path: '~/.dsh/notes/facts.json',
+          maxBytes: 65536,
+          warnPct: 80,
         },
         {
           id: 'reading-log',
@@ -33,6 +35,8 @@
           idField: 'key',
           titleField: 'title',
           dateField: 'at',
+          maxBytes: 262144,
+          warnPct: 80,
         },
         {
           id: 'notes',
@@ -40,6 +44,8 @@
           path: '~/.dsh/notes/notes.md',
           sections: ['称呼与偏好', '当前在做什么'],
           maxChars: 700,
+          maxBytes: 4096,
+          warnPct: 80,
         },
       ], null, 2)
 
@@ -102,6 +108,11 @@
         '[data-cc-badge][data-status="ok"]{color:#22c55e;}',
         '[data-cc-badge][data-status="missing"],[data-cc-badge][data-status="error"]{color:#ef4444;}',
         '[data-cc-badge][data-status="empty"],[data-cc-badge][data-status="stale"]{color:#f59e0b;}',
+        '[data-cc-bar]{height:6px;border-radius:3px;background:rgba(128,128,128,.18);overflow:hidden;margin-top:5px;}',
+        '[data-cc-bar] i{display:block;height:100%;background:#22c55e;transition:width .2s;}',
+        '[data-cc-bar][data-state="warn"] i{background:#f59e0b;}',
+        '[data-cc-bar][data-state="over"] i{background:#ef4444;}',
+        '[data-cc-bar][data-state="off"] i{background:rgba(128,128,128,.35);}',
         '[data-cc-steps]{margin:0;padding-left:18px;font-size:12px;line-height:20px;}',
         '[data-cc-mono]{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;}',
       ].join('')
@@ -147,6 +158,12 @@
         } catch {
           return '—'
         }
+      }
+
+      function numberOr(value, fallback) {
+        if (value === '' || value === undefined || value === null) return fallback
+        var n = Number(value)
+        return Number.isFinite(n) ? n : fallback
       }
 
       function fmtBytes(value) {
@@ -239,6 +256,7 @@
           var nudge = base.nudge || {}
           var tone = base.tone || {}
           var wall = base.wall || {}
+          var decay = base.decay || {}
           return {
             enabled: base.enabled !== false,
             sources: sources,
@@ -269,6 +287,16 @@
               enabled: wall.enabled !== false,
               turns: wall.turns === 0 ? 0 : (Number(wall.turns) || 2),
               header: typeof wall.header === 'string' ? wall.header : '',
+            },
+            decay: {
+              enabled: decay.enabled !== false,
+              graceDays: numberOr(decay.graceDays, 14),
+              stepDays: numberOr(decay.stepDays, 21),
+              recoverDays: numberOr(decay.recoverDays, 30),
+              maxRecover: numberOr(decay.maxRecover, 2),
+              importanceByScope: decay.importanceByScope && typeof decay.importanceByScope === 'object'
+                ? decay.importanceByScope
+                : {},
             },
           }
         }
@@ -382,6 +410,22 @@
             : (wallState === 'already'
               ? '压缩痕迹已注入过，等待下一次压缩'
               : '已关闭'))
+        var decay = draft.decay || {}
+        var decayState = state.decay || {}
+        var decayFacts = decayState.facts || {}
+        var decayDropped = Number(decayState.droppedToday) || 0
+        var decayLevels = [
+          { key: 'vivid', label: '鲜明', value: Number(decayFacts.vivid) || 0 },
+          { key: 'clear', label: '清楚', value: Number(decayFacts.clear) || 0 },
+          { key: 'fuzzy', label: '模糊', value: Number(decayFacts.fuzzy) || 0 },
+          { key: 'trace', label: '印象', value: Number(decayFacts.trace) || 0 },
+        ]
+        var redline = Array.isArray(state.redline) ? state.redline : []
+        var decayStatusLine = decay.enabled === false
+          ? '已关闭（不计算清晰度）'
+          : (decayDropped > 0
+            ? ('今天已提示 ' + decayDropped + ' 条降档')
+            : '今天没有降档')
         var hasSources = (draft.sources || []).length > 0
 
         return h('div', { 'data-cc-page': '' },
@@ -448,6 +492,8 @@
               'JSON 数组。每项至少要有 id、kind、path；path 支持 ~ 和环境变量。',
               h('br'),
               'markdown 源用 sections 或 tailLines 取正文，maxChars 是单源硬上限。',
+              h('br'),
+              'maxBytes 是每个源自己的体量红线（字节，0 = 不检查）；warnPct 默认 80。',
               h('br'),
               '不配 sources ⇒ 目录什么都不注入。')),
 
@@ -597,6 +643,93 @@
             h('div', { 'data-cc-note': '' },
               '只报元信息与找回命令；不摘要、不估 token、不写文件。'),
             h('div', { 'data-cc-note': '' }, wallStatusLine)),
+
+          h('div', { 'data-cc-sec': '' },
+            h('div', { 'data-cc-h': '' }, '记忆保养'),
+            h('div', { 'data-cc-row': '' },
+              h('span', { 'data-cc-label': '' }, '启用清晰度与红线提示'),
+              h(Switch, {
+                on: decay.enabled !== false,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { decay: Object.assign({}, decay, { enabled: value }) }))
+                },
+              }),
+              h('span', { 'data-cc-note': '' }, '只在过档或有源接近红线时提示；不写文件')),
+            h('div', { 'data-cc-note': '' },
+              '四档分布：' + decayLevels.map(function (item) {
+                return item.label + ' ' + item.value
+              }).join(' · ')),
+            h('div', { 'data-cc-note': '' }, decayStatusLine),
+            h('div', { 'data-cc-grid': '' },
+              h(NumberField, {
+                label: 'graceDays',
+                value: decay.graceDays,
+                min: 0,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { decay: Object.assign({}, decay, { graceDays: Number(value) || 0 }) }))
+                },
+                note: '验证后多少天内保持清晰',
+              }),
+              h(NumberField, {
+                label: 'stepDays',
+                value: decay.stepDays,
+                min: 1,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { decay: Object.assign({}, decay, { stepDays: Number(value) || 1 }) }))
+                },
+                note: '之后每多少天降一档',
+              }),
+              h(NumberField, {
+                label: 'recoverDays',
+                value: decay.recoverDays,
+                min: 0,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { decay: Object.assign({}, decay, { recoverDays: Number(value) || 0 }) }))
+                },
+                note: '多少天内的命中算复习',
+              }),
+              h(NumberField, {
+                label: 'maxRecover',
+                value: decay.maxRecover,
+                min: 0,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { decay: Object.assign({}, decay, { maxRecover: Number(value) || 0 }) }))
+                },
+                note: '复习最多回升几档',
+              })),
+            h('div', { 'data-cc-note': '' },
+              '重要度按 scope 的默认值在配置文件里改；facts 里写了 importance 就优先用它。'),
+            h('div', { 'data-cc-h': '' }, '源容量'),
+            redline.length
+              ? redline.map(function (item, index) {
+                var pct = Number(item.pct)
+                var width = item.pct === null || item.pct === undefined || !Number.isFinite(pct)
+                  ? 0
+                  : Math.max(0, Math.min(100, pct))
+                var stateLabel = item.state === 'over'
+                  ? '过线'
+                  : (item.state === 'warn'
+                    ? '接近红线'
+                    : (item.state === 'off' ? '未设红线' : '正常'))
+                var line = (Number(item.bytes) || 0) + ' B'
+                  + (item.pct !== null && item.pct !== undefined ? ' · ' + item.pct + '%' : '')
+                  + (Number(item.maxBytes) > 0 ? ' · 红线 ' + item.maxBytes + ' B' : '')
+                return h('div', { 'data-cc-src': '', key: item.id + ':' + index },
+                  h('div', { 'data-cc-row': '' },
+                    h('span', { 'data-cc-label': '' }, item.id || '(no-id)'),
+                    h('span', { 'data-cc-note': '' }, stateLabel)),
+                  h('div', { 'data-cc-kv': '' }, line),
+                  h('div', { 'data-cc-bar': '', 'data-state': item.state || 'off' },
+                    h('i', { style: { width: width + '%' } })))
+              })
+              : h('div', { 'data-cc-note': '' }, '还没有源设置 maxBytes；在 sources JSON 里加 maxBytes 才会出现容量条。'),
+            h('div', { 'data-cc-note': '' },
+              '红线是每个源自己的 maxBytes；warnPct 默认 80。容量条只读文件大小，不修改文件。')),
 
           h('div', { 'data-cc-sec': '' },
             h('div', { 'data-cc-h': '' }, '裁剪与时机'),

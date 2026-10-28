@@ -13,6 +13,8 @@
 - 是**语气样本器**：`tone` 在压缩后回放压缩点之前的最后几轮原话，只读当前会话事件。
 - 是**压缩痕迹提示器**：`wall` 在压缩后告诉模型“历史被截过、原始对话还在、去哪取”，
   只给元信息，不含任何内容摘要。
+- 是**记忆保养计算器**：`decay` 给每条事实算清晰度，给每个源算体量百分比；
+  只计算、只显示、偶尔提示一行，不写任何文件。
 - **不是记忆存储**：不建数据库、不建缓存副本、不往账本里写一个字。
 - **不是检索器**：没有 embedding、召回、重排，也不会凭标题猜正文。
 - **不是自动抽取器**：不会从对话里把“模型觉得重要”的内容写进“你觉得重要”的账本。
@@ -58,6 +60,8 @@ sources:
       - 称呼与偏好
       - 当前在做什么
     maxChars: 700
+    maxBytes: 4096
+    warnPct: 80
 
 maxLines: 7
 maxChars: 1600
@@ -106,6 +110,8 @@ maxChars: 1600
 | `sections` | `[]` | markdown 二级标题白名单，例如 `["称呼与偏好"]` |
 | `tailLines` | `0` | markdown 只取末尾 N 行；与 `sections` 二选一 |
 | `maxChars` | `800` | 仅 markdown：单个源的正文硬上限，超了截断加 `…` |
+| `maxBytes` | `0` | 体量红线（字节）；`0` = 不检查 |
+| `warnPct` | `80` | 达到红线的这个百分比就算 `warn`；100 以上算 `over` |
 | `enabled` | `true` | 单独停用这个来源 |
 
 全局字段：
@@ -241,15 +247,71 @@ wall:
   没有压缩点时是 `wall：没有压缩点，跳过`。
 - 默认开启。每个会话、每次压缩后会多一条约 5 行（约 150 token）的消息；不想要就在面板关掉。
 
-## 三个注入的职责边界
+## decay：记忆保养（只算，不写）
+
+`ttlDays` 继续表示“这条该重新验证了”（硬信号，标 stale）；`decay` 另算
+“我还记得多清楚”（软刻度）。两者并存，互不替代。
+
+```yaml
+decay:
+  enabled: true
+  graceDays: 14
+  stepDays: 21
+  recoverDays: 30
+  maxRecover: 2
+  importanceByScope:
+    self: 90
+    project: 70
+    machine: 55
+    tool: 45
+    default: 50
+```
+
+清晰度是纯函数算出来的，不调模型、不随机、不存状态：
+
+- 四档：`vivid` 鲜明 / `clear` 清楚 / `fuzzy` 模糊 / `trace` 印象。
+- `lastSeen = max(verifiedAt, 最近一次命中)`；`ageDays = (now - lastSeen) / 86400000`。
+- `steps = ageDays < graceDays ? 0 : min(3, 1 + floor((ageDays - graceDays) / stepDays))`。
+- `recover = min(maxRecover, recoverDays 窗口内的命中数)`。
+- `maxLevel = importance >= 80 ? 1 : importance >= 50 ? 2 : 3`，重要的最差停在「清楚」。
+- `level = clamp(steps - recover, 0, maxLevel)`。
+- `importance = fact.importance ?? importanceByScope[fact.scope] ?? importanceByScope.default`。
+- `pinned: true` 恒定 vivid；`verifiedAt` 缺失或解析不了 ⇒ vivid + `no-date`，不猜日期。
+- facts / jsonl 条目如果自带 `hits` 数组，会用它算复习；没有就只按 `verifiedAt`。
+
+体量红线是每个源自己的事：
+
+- `maxBytes > 0` 时 `pct = round(bytes / maxBytes * 100)`；`state` 是 `off` / `ok` / `warn` / `over`。
+- `maxBytes: 0` ⇒ `off`，不判断；面板仍显示实际字节数。
+- 默认 `warnPct: 80`，到 100% 就是 `over`。
+
+注入只在两个条件都满足时发生：距上次提示已跨天（`dayKey` 不同），且本次至少 1 条事实
+降档、或至少 1 个源 `warn` / `over`。同一会话同一天最多一条；没有内容就一个字都不注入。
+
+```text
+<memory-decay do-not-execute>
+记忆保养：now.md 3182 B（78%，红线 4096）；3 条事实降档（2→模糊，1→印象）。
+要搬的话搬到 notes/archive/（本版不会自动搬）。
+</memory-decay do-not-execute>
+```
+
+- `source.kind` 是 `cardcatalog-decay`，独立成段。
+- 默认开启；每次 pre-step 会重读 facts/jsonl、stat 一次源文件，但不建缓存；
+  只在有内容且跨天时注入一条。
+- 日志：`decay：vivid 12 / clear 3 / fuzzy 1 / trace 0`；
+  `redline：now.md 3182 B（78%），未过线` / `，接近红线` / `，过线`。
+- 本版只提示，不搬文件；归档改写留给后续版本。
+
+## 注入的职责边界
 
 | 注入 | 内容 | 频率 |
 |---|---|---|
 | 目录 | 账本**标题** | 每会话一次（走 system prompt） |
 | tone | 压缩点之前的**原话** | 每个压缩点一次 |
 | wall | 压缩的**元信息 + 命令** | 每个压缩点一次 |
+| decay | 清晰度分布 / 体量红线 | 每天最多一次（有内容时） |
 
-wall 不含内容，tone 不含元信息；两者都不写文件。
+wall 不含内容，tone 不含元信息，decay 只给计数；三者都不写文件。
 
 ## 注入出来是什么样
 
@@ -283,8 +345,8 @@ wall 不含内容，tone 不含元信息；两者都不写文件。
 `every-n-turns` 只是给“长会话容易跑题”留的开关，默认关。
 宿主提供系统提示接缝时，目录位于稳定前缀中，后续请求复用前缀缓存；只有消息接缝时，
 它是一条只追加一次的消息。nudge 需要知道轮次，tone / wall 需要读取会话事件并在压缩点后
-注入，因此都走消息接缝；开启任一者时，即使目录走系统提示，也会额外注册一个轻量的
-pre-step 检查。
+注入，decay 需要按天比较清晰度，因此都走消息接缝；开启任一者时，即使目录走系统提示，
+也会额外注册一个轻量的 pre-step 检查。
 
 ## 设置页
 
@@ -294,7 +356,9 @@ pre-step 检查。
   状态是 `ok` / `missing` / `empty` / `error`，错误会附一句原因。
 - **还没配 sources 时**给三步引导，并显示当前工作区 `AGENTS.md` 的路径、是否存在、大小。
 - **给模型的说明书**：固定文本 + 「复制片段」按钮；插件**不写** AGENTS.md。
-- 可以编辑 sources、markdown 小节/末尾行数、nudge、tone、wall、裁剪参数和注入时机，并点「预览」。
+- 可以编辑 sources（含 `maxBytes` / `warnPct`）、markdown 小节/末尾行数、nudge、tone、
+  wall、decay、裁剪参数和注入时机，并点「预览」。
+- 「记忆保养」卡显示四档清晰度分布，以及每个源的容量条（绿 / 黄 / 红）；只读文件大小。
 - 保存只写**投影配置**，不写账本；没有可写设置服务时，页面不会注册，
   配置改从 `~/.dsh/cardcatalog/config.json` 读。
 
@@ -303,7 +367,8 @@ pre-step 检查。
 - **R1 不收集个人数据。** 仓库源码、文档、fixture 全部使用假数据：没有真实用户名、
   没有盘符绝对路径、没有 token、没有真实条目标题。
 - **R2 不打印账本内容。** 日志只打“注入了 N 行”、来源跳过原因、接缝状态，以及
-  压缩次数/事件数/真人消息数这类纯计数；不打账本内容，也不打账本路径。
+  压缩次数/事件数/真人消息数、清晰度分布、源字节数这类纯计数；不打账本内容，
+  也不打账本路径。
 - **R3 不联网、不后台运行。** 没有网络请求、定时器、后台任务；只在注入或面板请求时读文件。
 - **R4 不建立第二份记忆。** 不建数据库、不建索引、不缓存副本；账本永远只有用户那一份。
 - **R5 不猜路径、不猜格式。** 路径必须显式配置；文件不存在就跳过，不创建默认文件。
@@ -336,7 +401,7 @@ CI 会扫三类并失败即红：盘符绝对路径、连续 32 位以上十六�
 ### 它会不会改我的文件？
 
 不会。见 R6：不写 AGENTS.md、不写 source 文件、不创建 nudge 文件。`nudge` 也只提醒，
-不代写、不总结。
+不代写、不总结；`decay` 只计算清晰度和字节数，不建状态文件、不搬归档。
 
 ### markdown 源为什么不整篇塞进去？
 
@@ -375,6 +440,10 @@ CI 会扫三类并失败即红：盘符绝对路径、连续 32 位以上十六�
 | wall 没有压缩点 | 不注入，日志 `wall：没有压缩点，跳过` |
 | wall 拿不到压缩点时间 | 仍注入，但不写“N 分钟前” |
 | wall 与 tone 同一轮满足条件 | 两条独立消息，wall 在前、tone 在后 |
+| decay 的 `verifiedAt` 缺失/坏掉 | 按 vivid 处理，标 `no-date`，不猜日期 |
+| decay 没有降档且没有源接近/过线 | 不注入，只记日志 |
+| 同一会话同一天已提示过 | 不再重复注入 |
+| 源文件读不到大小 | 红线按 0 B 处理，不崩；来源状态卡会说明 |
 | 全部 source 失败 | 不注入任何段落 |
 | 注入 0 行 | 不注入任何段落 |
 | 本会话已有目录 | 不重复注入，日志一行「本会话已有目录，跳过注入」 |
@@ -393,6 +462,8 @@ CI 会扫三类并失败即红：盘符绝对路径、连续 32 位以上十六�
 - **P5 拿不到宿主服务就降级并明说。** 宁可没有注入，也不要假装注入成功。
 - **P6 nudge 只提醒，不代写。** 写入是用户和模型的事，插件不碰。
 - **P7 压缩痕迹只给指针。** wall 不摘要、不列主题、不估 token；内容由 tone 和用户命令负责。
+- **P8 软硬分开。** `ttlDays` 是“该重新验证”的硬信号，`decay` 的 clarity 是“还记得多清楚”的
+  软刻度；两者并存，不互相覆盖。
 
 ## 设计启发（Credits）
 
@@ -413,6 +484,11 @@ CI 会扫三类并失败即红：盘符绝对路径、连续 32 位以上十六�
 - [suanrongqieqiezi/bigeye](https://github.com/suanrongqieqiezi/bigeye) —— 「上下文墙」：
   裁剪后告诉模型“看得见多少、被整理掉多少、去哪找回”。本插件的 `wall` 只取这个
   指针思路，不取它的存档机制；原始事件本来就在 `snapshotEvents()` 里，不需要另建档案。
+- [Mieksido/surfcore](https://github.com/Mieksido/surfcore) —— 衰减记忆卡：四档清晰度、
+  命中回升、重要度是纯函数、模糊化是确定性截断而不是模型摘要。本版只取清晰度计算，
+  不取截断/摘要。
+- [mashanglinyu/luanyujia-workbench](https://github.com/mashanglinyu/luanyujia-workbench) ——
+  体量红线、到线动作与写回判据。本版只取红线判定，不取搬运/改写。
 
 以上项目各自适用其原许可证；本插件不包含它们的代码，故不随之变更许可。
 如归属有误或遗漏，请开 issue，我们立刻更正。

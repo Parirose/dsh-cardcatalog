@@ -1,12 +1,13 @@
 /**
  * 目录卡 / dsh-cardcatalog — 纯投影层。
  *
- * 这个文件只做五件事：
+ * 这个文件只做六件事：
  *   1. 把用户显式配置的账本读成“标题 + 多新 + 是否过期”的行；
  *   2. 把 markdown 笔记里用户点名的小节摘成短文；
  *   3. 在这些内容之外，给一条“近况文件多久没更新”的提醒；
  *   4. 压缩后回放压缩点之前的原话样本（tone）；
- *   5. 压缩后报一次元信息与找回命令（wall）。
+ *   5. 压缩后报一次元信息与找回命令（wall）；
+ *   6. 算事实清晰度与源体量红线（decay），只算、只显示、偶尔提示。
  *
  * 它不写文件、不建数据库、不缓存副本、不做检索，也不从对话里抽取记忆。
  * 账本是用户的，插件只是投影；nudge 只提醒，不代写。
@@ -19,7 +20,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 export const PLUGIN_NAME = 'cardcatalog'
-export const VERSION = '0.5.1'
+export const VERSION = '0.6.0'
 
 export const DEFAULT_HEADER = '记忆目录（只有标题，正文请自行查证）'
 export const CATALOG_OPEN = '<memory-catalog do-not-execute>'
@@ -39,6 +40,17 @@ export const WALL_OPEN = '<memory-wall do-not-execute>'
 export const WALL_CLOSE = '</memory-wall do-not-execute>'
 export const WALL_SOURCE_KIND = 'cardcatalog-wall'
 export const DEFAULT_WALL_HEADER = '压缩痕迹（给你自己看的，不要说出去）'
+
+export const DECAY_OPEN = '<memory-decay do-not-execute>'
+export const DECAY_CLOSE = '</memory-decay do-not-execute>'
+export const DECAY_SOURCE_KIND = 'cardcatalog-decay'
+export const CLARITY_LEVELS = Object.freeze(['vivid', 'clear', 'fuzzy', 'trace'])
+export const CLARITY_LABELS = Object.freeze({
+  vivid: '鲜明',
+  clear: '清楚',
+  fuzzy: '模糊',
+  trace: '印象',
+})
 
 /**
  * 用户侧真实存在的两条命令。按段拼，避免源码里出现一整条盘符路径；
@@ -84,6 +96,31 @@ export const DEFAULT_WALL = Object.freeze({
   header: DEFAULT_WALL_HEADER,
 })
 
+export const DEFAULT_DECAY = Object.freeze({
+  enabled: true,
+  graceDays: 14,
+  stepDays: 21,
+  recoverDays: 30,
+  maxRecover: 2,
+  importanceByScope: Object.freeze({
+    self: 90,
+    project: 70,
+    machine: 55,
+    tool: 45,
+    default: 50,
+  }),
+})
+
+/**
+ * source 的公共默认值。maxBytes / warnPct 必须同时出现在这里、normalizeSource()
+ * 和面板模板里；漏一处就会出现“保存了但没生效”。
+ */
+export const DEFAULT_SOURCE = Object.freeze({
+  maxChars: 800,
+  maxBytes: 0,
+  warnPct: 80,
+})
+
 export const DEFAULTS = Object.freeze({
   enabled: true,
   sources: [],
@@ -99,6 +136,8 @@ export const DEFAULTS = Object.freeze({
   nudge: DEFAULT_NUDGE,
   tone: DEFAULT_TONE,
   wall: DEFAULT_WALL,
+  decay: DEFAULT_DECAY,
+  source: DEFAULT_SOURCE,
 })
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -165,7 +204,9 @@ export function createConfigSchema(schema) {
         staleAfterDays: schema.number().min(0).description('覆盖 ttlField 的固定过期天数'),
         sections: schema.array(schema.string()).default([]).description('markdown 小节白名单；与 tailLines 二选一'),
         tailLines: schema.number().min(0).step(1).default(0).description('markdown 只取末尾 N 行'),
-        maxChars: schema.number().min(0).step(1).default(800).description('markdown 单源字符上限'),
+        maxChars: schema.number().min(0).step(1).default(DEFAULT_SOURCE.maxChars).description('markdown 单源字符上限'),
+        maxBytes: schema.number().min(0).step(1).default(DEFAULT_SOURCE.maxBytes).description('体量红线（字节）；0 = 不检查'),
+        warnPct: schema.number().min(0).max(100).step(1).default(DEFAULT_SOURCE.warnPct).description('超过红线的这个百分比就算"该收拾了"'),
         enabled: schema.boolean().default(true).description('这个来源是否启用'),
       })).default([]).description('账本列表；不配就不注入').extra('volatile', true),
       injectAt: schema.union([schema.const('session-start'), schema.const('every-n-turns')]).default('session-start').description('注入时机').extra('volatile', true),
@@ -196,6 +237,16 @@ export function createConfigSchema(schema) {
         turns: schema.number().min(0).step(1).default(2).description('提示里建议回取的原话轮数'),
         header: schema.string().default(DEFAULT_WALL_HEADER).description('痕迹提示的标题行'),
       }).default({}).description('压缩的元信息与找回命令；不含任何内容摘要').extra('volatile', true),
+      decay: schema.object({
+        enabled: schema.boolean().default(DEFAULT_DECAY.enabled).description('计算事实清晰度并在过档时提示'),
+        graceDays: schema.number().min(0).step(1).default(DEFAULT_DECAY.graceDays).description('验证后多少天内保持清晰'),
+        stepDays: schema.number().min(1).step(1).default(DEFAULT_DECAY.stepDays).description('之后每多少天降一档'),
+        recoverDays: schema.number().min(0).step(1).default(DEFAULT_DECAY.recoverDays).description('多少天内的命中算"复习"'),
+        maxRecover: schema.number().min(0).step(1).default(DEFAULT_DECAY.maxRecover).description('复习最多回升几档'),
+        importanceByScope: schema.dict(schema.number().min(0).max(100)).default({
+          ...DEFAULT_DECAY.importanceByScope,
+        }).description('按 scope 给的默认重要度；facts 里写了 importance 就优先用它'),
+      }).default({}).description('事实清晰度与体量红线；只计算，不写文件').extra('volatile', true),
     })
 }
 
@@ -229,7 +280,9 @@ function normalizeSource(raw, index) {
     staleAfterDays: nonNegativeNumber(item.staleAfterDays),
     sections,
     tailLines: integerOr(item.tailLines, 0, 0),
-    maxChars: integerOr(item.maxChars, 800, 0),
+    maxChars: integerOr(item.maxChars, DEFAULT_SOURCE.maxChars, 0),
+    maxBytes: integerOr(item.maxBytes, DEFAULT_SOURCE.maxBytes, 0),
+    warnPct: Math.min(100, integerOr(item.warnPct, DEFAULT_SOURCE.warnPct, 0)),
     enabled: item.enabled !== false,
   }
 }
@@ -266,6 +319,29 @@ function normalizeWall(raw) {
     enabled: typeof enabled === 'boolean' ? enabled : DEFAULT_WALL.enabled,
     turns: integerOr(configValue(item.turns), DEFAULT_WALL.turns, 0),
     header: typeof header === 'string' && header.trim() !== '' ? header : DEFAULT_WALL.header,
+  }
+}
+
+function normalizeDecay(raw) {
+  const item = raw && typeof raw === 'object' ? raw : {}
+  const enabled = configValue(item.enabled)
+  const scopeRaw = configValue(item.importanceByScope)
+  const importanceByScope = { ...DEFAULT_DECAY.importanceByScope }
+  if (scopeRaw && typeof scopeRaw === 'object' && !Array.isArray(scopeRaw)) {
+    for (const [scope, value] of Object.entries(scopeRaw)) {
+      const rawValue = configValue(value)
+      if (rawValue === undefined || rawValue === null || rawValue === '') continue
+      const n = Number(rawValue)
+      if (Number.isFinite(n)) importanceByScope[scope] = Math.min(100, Math.max(0, n))
+    }
+  }
+  return {
+    enabled: typeof enabled === 'boolean' ? enabled : DEFAULT_DECAY.enabled,
+    graceDays: integerOr(configValue(item.graceDays), DEFAULT_DECAY.graceDays, 0),
+    stepDays: integerOr(configValue(item.stepDays), DEFAULT_DECAY.stepDays, 1),
+    recoverDays: integerOr(configValue(item.recoverDays), DEFAULT_DECAY.recoverDays, 0),
+    maxRecover: integerOr(configValue(item.maxRecover), DEFAULT_DECAY.maxRecover, 0),
+    importanceByScope,
   }
 }
 
@@ -324,6 +400,7 @@ export function normalizeConfig(raw) {
     nudge: normalizeNudge(configValue(config.nudge)),
     tone: normalizeTone(configValue(config.tone)),
     wall: normalizeWall(configValue(config.wall)),
+    decay: normalizeDecay(configValue(config.decay)),
   }
 }
 
@@ -1161,6 +1238,259 @@ export function buildWall(rawConfig, events, options = {}) {
   }
 }
 
+function timeValue(value) {
+  if (value && typeof value === 'object' && !(value instanceof Date)) {
+    return parseDate(value.at ?? value.time ?? value.timestamp)
+  }
+  return parseDate(value)
+}
+
+function importanceOfFact(fact, decay) {
+  const raw = configValue(fact.importance)
+  if (raw !== undefined && raw !== null && raw !== '') {
+    const n = Number(raw)
+    if (Number.isFinite(n)) return Math.min(100, Math.max(0, n))
+  }
+  const scope = configValue(fact.scope)
+  if (typeof scope === 'string' && Number.isFinite(decay.importanceByScope[scope])) {
+    return decay.importanceByScope[scope]
+  }
+  return decay.importanceByScope.default ?? 50
+}
+
+/**
+ * 一条事实的清晰度。纯函数：不读文件、不调模型、不看随机数。
+ *
+ * @param {object} fact
+ * @param {object} config 完整配置，或只传 decay 对象
+ * @param {Array<number|string|{at?: number, time?: number}>} [hits]
+ * @param {number} [now]
+ * @returns {{level: number, clarity: string, ageDays: number, importance: number,
+ *   maxLevel: number, reason: 'ok'|'pinned'|'no-date'}}
+ */
+export function clarityOf(fact, config, hits, now) {
+  const item = fact && typeof fact === 'object' ? fact : {}
+  const decaySource = config && typeof config === 'object' && config.decay
+    ? configValue(config.decay)
+    : config
+  const decay = normalizeDecay(decaySource)
+  const at = Number.isFinite(now) ? Number(now) : Date.now()
+  const importance = importanceOfFact(item, decay)
+  const maxLevel = importance >= 80 ? 1 : (importance >= 50 ? 2 : 3)
+  const verified = timeValue(item.verifiedAt)
+  const hitTimes = Array.isArray(hits) ? hits.map(timeValue).filter((value) => value !== null) : []
+
+  if (item.pinned === true) {
+    return {
+      level: 0,
+      clarity: CLARITY_LEVELS[0],
+      ageDays: verified === null ? 0 : Math.max(0, (at - verified) / DAY_MS),
+      importance,
+      maxLevel,
+      reason: 'pinned',
+    }
+  }
+  if (verified === null) {
+    return {
+      level: 0,
+      clarity: CLARITY_LEVELS[0],
+      ageDays: 0,
+      importance,
+      maxLevel,
+      reason: 'no-date',
+    }
+  }
+
+  const latestHit = hitTimes.length > 0 ? Math.max(...hitTimes) : null
+  const lastSeen = latestHit === null ? verified : Math.max(verified, latestHit)
+  const ageDays = Math.max(0, (at - lastSeen) / DAY_MS)
+  const steps = ageDays < decay.graceDays
+    ? 0
+    : Math.min(3, 1 + Math.floor((ageDays - decay.graceDays) / decay.stepDays))
+  const windowStart = at - decay.recoverDays * DAY_MS
+  const recover = Math.min(
+    decay.maxRecover,
+    hitTimes.filter((value) => value >= windowStart && value <= at).length,
+  )
+  const level = Math.max(0, Math.min(maxLevel, steps - recover))
+  return {
+    level,
+    clarity: CLARITY_LEVELS[level],
+    ageDays,
+    importance,
+    maxLevel,
+    reason: 'ok',
+  }
+}
+
+/**
+ * 每个源的体量红线。纯函数：文件大小由调用方通过 statOf 提供。
+ *
+ * @param {unknown} rawConfig
+ * @param {(source: object) => ({size?: number}|number|null)} [statOf]
+ * @returns {Array<{id: string, bytes: number, pct: number|null, maxBytes: number,
+ *   state: 'off'|'ok'|'warn'|'over'}>}
+ */
+export function redlineOf(rawConfig, statOf) {
+  const config = normalizeConfig(rawConfig)
+  return config.sources.map((source) => {
+    const maxBytes = source.maxBytes
+    let bytes = 0
+    if (typeof statOf === 'function') {
+      try {
+        const stat = statOf(source)
+        const size = typeof stat === 'number' ? stat : stat?.size
+        if (Number.isFinite(size)) bytes = Math.max(0, size)
+      } catch {
+        // 读不到大小就当 0；面板的来源状态卡会说明读取失败。
+      }
+    }
+    const pct = maxBytes > 0 ? Math.round((bytes / maxBytes) * 100) : null
+    const state = maxBytes === 0
+      ? 'off'
+      : (pct >= 100 ? 'over' : (pct >= source.warnPct ? 'warn' : 'ok'))
+    return { id: source.id, bytes, pct, maxBytes, state }
+  })
+}
+
+function sourceLabel(source) {
+  const file = typeof source?.path === 'string' ? source.path : ''
+  if (file) return nudgeFileLabel(file) || oneLine(source.id) || 'source'
+  return oneLine(source?.id) || 'source'
+}
+
+function dayKeyOf(now) {
+  const date = new Date(now)
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+function collectDecayFacts(config) {
+  const facts = []
+  for (const source of config.sources) {
+    if (!source.enabled || source.kind === 'markdown' || !source.path) continue
+    let items
+    try {
+      items = parseItems(source, readSourceText(source))
+    } catch {
+      continue
+    }
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index]
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+      const rawId = item[source.idField]
+      const id = rawId === undefined || rawId === null || rawId === ''
+        ? `#${index + 1}`
+        : String(rawId)
+      facts.push({
+        source,
+        item,
+        id,
+        key: `${source.id}\u0000${id}`,
+      })
+    }
+  }
+  return facts
+}
+
+/**
+ * 只读的保养报告：事实清晰度分布、本次跨档、每个源的体量红线。
+ * 不写文件；previousLevels 只用于比较“上一次观测到的档位”。
+ *
+ * @param {unknown} rawConfig
+ * @param {{now?: number, previousLevels?: Map<string, number>}} [options]
+ */
+export function inspectDecay(rawConfig, options = {}) {
+  const config = normalizeConfig(rawConfig)
+  const now = Number.isFinite(options.now) ? Number(options.now) : Date.now()
+  const redline = redlineOf(config, (source) => statOrNull(expandConfiguredPath(source.path)))
+    .map((entry, index) => ({ ...entry, label: sourceLabel(config.sources[index]) }))
+  const facts = { vivid: 0, clear: 0, fuzzy: 0, trace: 0 }
+  const items = []
+  const levels = new Map()
+  const dropped = []
+  if (!config.decay.enabled) {
+    return {
+      enabled: false,
+      facts,
+      items,
+      levels,
+      dropped,
+      redline,
+      dayKey: dayKeyOf(now),
+      totalFacts: 0,
+    }
+  }
+
+  const previous = options.previousLevels instanceof Map ? options.previousLevels : null
+  for (const entry of collectDecayFacts(config)) {
+    const hits = Array.isArray(entry.item.hits) ? entry.item.hits : []
+    const result = clarityOf(entry.item, config, hits, now)
+    facts[result.clarity] += 1
+    levels.set(entry.key, result.level)
+    const title = sanitizeTitle(entry.item[entry.source.titleField], entry.id)
+    items.push({ key: entry.key, source: entry.source.id, title, ...result })
+    if (previous && previous.has(entry.key)) {
+      const before = previous.get(entry.key)
+      if (Number.isFinite(before) && result.level > before) {
+        dropped.push({
+          key: entry.key,
+          title,
+          from: before,
+          to: result.level,
+          clarity: result.clarity,
+        })
+      }
+    }
+  }
+  return {
+    enabled: true,
+    facts,
+    items,
+    levels,
+    dropped,
+    redline,
+    dayKey: dayKeyOf(now),
+    totalFacts: items.length,
+  }
+}
+
+/**
+ * 记忆保养提示：只在有跨档或有源接近/过线时返回内容，否则空串。
+ *
+ * @param {{dropped?: Array<object>, redline?: Array<object>}} report
+ * @returns {string}
+ */
+export function renderDecayLine(report) {
+  const dropped = Array.isArray(report?.dropped) ? report.dropped : []
+  const redline = Array.isArray(report?.redline) ? report.redline : []
+  const hot = redline.filter((item) => item && (item.state === 'warn' || item.state === 'over'))
+  if (dropped.length === 0 && hot.length === 0) return ''
+
+  const parts = []
+  for (const item of hot) {
+    const label = oneLine(item.label) || oneLine(item.id) || 'source'
+    const pct = Number.isFinite(item.pct) ? item.pct : 0
+    parts.push(`${label} ${item.bytes} B（${pct}%，红线 ${item.maxBytes}）`)
+  }
+  let text = '记忆保养：'
+  if (parts.length > 0) text += parts.join('；')
+  if (dropped.length > 0) {
+    if (parts.length > 0) text += '；'
+    const counts = new Map()
+    for (const item of dropped) {
+      const key = CLARITY_LABELS[item.clarity] ? item.clarity : 'trace'
+      counts.set(key, (counts.get(key) || 0) + 1)
+    }
+    const detail = ['clear', 'fuzzy', 'trace']
+      .filter((key) => counts.has(key))
+      .map((key) => `${counts.get(key)}→${CLARITY_LABELS[key]}`)
+      .join('，')
+    text += `${dropped.length} 条事实降档（${detail}）`
+  }
+  if (!text.endsWith('。')) text += '。'
+  return [DECAY_OPEN, text, '要搬的话搬到 notes/archive/（本版不会自动搬）。', DECAY_CLOSE].join('\n')
+}
+
 function inspectOneSource(source, now) {
   const base = {
     id: source.id,
@@ -1408,7 +1738,9 @@ function makeInjectedMessage(text, kind) {
         ? 'catalog'
         : (kind === NUDGE_SOURCE_KIND
           ? 'nudge'
-          : (kind === WALL_SOURCE_KIND ? 'wall' : 'tone')),
+          : (kind === WALL_SOURCE_KIND
+            ? 'wall'
+            : (kind === DECAY_SOURCE_KIND ? 'decay' : 'tone'))),
     }),
   })
 }
@@ -1602,15 +1934,44 @@ function installPreStepSeam(ctx, state, log, options) {
           }
         }
 
-        if (!catalogText && !nudgeText && !wallText && !toneText) return decision
+        let decayText = ''
+        if (state.config.decay.enabled && state.config.sources.some((source) => source.enabled)) {
+          const previous = state.decayLevels.get(id)
+          const report = inspectDecay(state.config, { previousLevels: previous })
+          state.decayLevels.set(id, report.levels)
+          if (!state.decayLogged.has(id)) {
+            state.decayLogged.add(id)
+            log(`decay：vivid ${report.facts.vivid} / clear ${report.facts.clear} / fuzzy ${report.facts.fuzzy} / trace ${report.facts.trace}`)
+            for (const item of report.redline) {
+              if (item.maxBytes === 0) continue
+              const mark = item.state === 'over'
+                ? '过线'
+                : (item.state === 'warn' ? '接近红线' : '未过线')
+              log(`redline：${item.label} ${item.bytes} B（${item.pct}%），${mark}`)
+            }
+          }
+          const lastDay = state.decayReportedDay.get(id)
+          const hot = report.redline.some((item) => item.state === 'warn' || item.state === 'over')
+          if (lastDay !== report.dayKey && (report.dropped.length > 0 || hot)) {
+            decayText = renderDecayLine(report)
+            if (decayText) {
+              state.decayReportedDay.set(id, report.dayKey)
+              state.decayLast = { dayKey: report.dayKey, dropped: report.dropped.length }
+              log(`decay：注入 ${report.dropped.length} 条降档${hot ? '，有源接近/过线' : ''}`)
+            }
+          }
+        }
+
+        if (!catalogText && !nudgeText && !wallText && !toneText && !decayText) return decision
         const outgoing = Array.isArray(decision.messages) ? [...decision.messages] : []
         if (catalogText || nudgeText) {
           const text = [catalogText, nudgeText].filter(Boolean).join('\n\n')
           outgoing.push(makeInjectedMessage(text, catalogText ? PLUGIN_NAME : NUDGE_SOURCE_KIND))
         }
-        // 先给自知（wall），再给样本（tone）。
+        // 先给自知（wall），再给样本（tone），最后是保养提示。
         if (wallText) outgoing.push(makeInjectedMessage(wallText, WALL_SOURCE_KIND))
         if (toneText) outgoing.push(makeInjectedMessage(toneText, TONE_SOURCE_KIND))
+        if (decayText) outgoing.push(makeInjectedMessage(decayText, DECAY_SOURCE_KIND))
         return {
           ...decision,
           messages: outgoing,
@@ -1641,6 +2002,7 @@ const CONFIG_KEYS = [
   'nudge',
   'tone',
   'wall',
+  'decay',
 ]
 
 /** 宿主若已经用 schema 填过默认值，这些值不应该盖住 config.json 里的用户默认。 */
@@ -1681,6 +2043,19 @@ function isBuiltInDefault(key, value) {
       return normalized.enabled === true
         && normalized.turns === DEFAULT_WALL.turns
         && normalized.header === DEFAULT_WALL.header
+    }
+    case 'decay': {
+      if (!value || typeof value !== 'object') return true
+      const normalized = normalizeDecay(value)
+      const defaults = DEFAULT_DECAY.importanceByScope
+      const scopes = Object.keys(defaults)
+      return normalized.enabled === true
+        && normalized.graceDays === DEFAULT_DECAY.graceDays
+        && normalized.stepDays === DEFAULT_DECAY.stepDays
+        && normalized.recoverDays === DEFAULT_DECAY.recoverDays
+        && normalized.maxRecover === DEFAULT_DECAY.maxRecover
+        && Object.keys(normalized.importanceByScope).length === scopes.length
+        && scopes.every((scope) => normalized.importanceByScope[scope] === defaults[scope])
     }
     default: return false
   }
@@ -1797,6 +2172,12 @@ function registerApi(ctx, state, log, ensureSeams) {
   const statePayload = () => {
     // 只复用这一次 inspectNudge 的结果，不为“会不会触发”再读一遍文件。
     const nudgeInfo = inspectNudge(state.config)
+    const decayReport = inspectDecay(state.config)
+    const droppedToday = state.config.decay.enabled
+      && state.decayLast
+      && state.decayLast.dayKey === decayReport.dayKey
+      ? state.decayLast.dropped
+      : 0
     return {
       ok: true,
       version: VERSION,
@@ -1815,6 +2196,17 @@ function registerApi(ctx, state, log, ensureSeams) {
       wallState: state.config.wall.enabled ? state.wallState : 'disabled',
       wallCount: state.wallCount,
       wallLastMinutes: state.wallLastMinutes,
+      decay: {
+        facts: decayReport.facts,
+        droppedToday,
+      },
+      redline: decayReport.redline.map((item) => ({
+        id: item.id,
+        bytes: item.bytes,
+        pct: item.pct,
+        maxBytes: item.maxBytes,
+        state: item.state,
+      })),
       onboarding: onboardingInfo(ctx),
       snippet: AGENTS_SNIPPET,
       preview: previewFor(state.config),
@@ -1870,6 +2262,9 @@ function registerApi(ctx, state, log, ensureSeams) {
       state.loggedInjection = false
       state.loggedEmpty = false
       state.loggedError = false
+      // 阈值/来源变了，下一次重新建立清晰度基线，并重新打一次诊断。
+      state.decayLevels.clear()
+      state.decayLogged.clear()
       if (!next.tone.enabled) {
         state.toneState = 'disabled'
         state.toneTurns = 0
@@ -1941,6 +2336,10 @@ function setup(ctx, rawConfig) {
     wallLogged: new Set(),
     wallCount: 0,
     wallLastMinutes: null,
+    decayLevels: new Map(),
+    decayLogged: new Set(),
+    decayReportedDay: new Map(),
+    decayLast: null,
   }
 
   const getCatalogText = () => {
@@ -1984,10 +2383,12 @@ function setup(ctx, rawConfig) {
     if (!state.systemPromptInstalled && installSystemPromptSeam(ctx, getCatalogText)) {
       state.systemPromptInstalled = true
     }
+    const hasEnabledSource = state.config.sources.some((source) => source.enabled)
     const needsMessage = !state.systemPromptInstalled
       || state.config.nudge.enabled
       || state.config.tone.enabled
       || state.config.wall.enabled
+      || (state.config.decay.enabled && hasEnabledSource)
     if (needsMessage && !state.preStepInstalled) {
       state.preStepInstalled = installPreStepSeam(ctx, state, log, {
         catalogViaMessage: !state.systemPromptInstalled,
