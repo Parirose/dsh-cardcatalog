@@ -1,8 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { cpSync, mkdtempSync, readdirSync, rmdirSync, unlinkSync } from 'node:fs'
+import { cpSync, mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
@@ -90,41 +90,31 @@ test('T4 stale 标记正确：100 天前 + ttl 30 出现 ⚠️stale', () => {
   assert.ok(!text.includes('⚠️stale [env-facts] node-not-on-path'))
 })
 
-function removeDir(dir) {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const target = join(dir, entry.name)
-    if (entry.isDirectory()) removeDir(target)
-    else unlinkSync(target)
-  }
-  rmdirSync(dir)
-}
-
-test('T5 删掉一个 source 文件：其余 source 正常且不抛异常', () => {
+test('T5 缺一个 source 文件：其余 source 正常且不抛异常', () => {
   const temp = mkdtempSync(join(tmpdir(), 'cardcatalog-test-'))
-  cpSync(FIXTURES, temp, { recursive: true })
-  unlinkSync(join(temp, 'log.jsonl'))
-  try {
-    const rows = collectCatalog(
-      {
-        sources: [
-          { id: 'env-facts', kind: 'facts', path: join(temp, 'facts.json') },
-          {
-            id: 'reading-log',
-            kind: 'jsonl',
-            path: join(temp, 'log.jsonl'),
-            idField: 'key',
-            titleField: 'title',
-            dateField: 'at',
-          },
-        ],
-      },
-      { now: FIXTURE_NOW },
-    )
-    assert.equal(rows.length, 3)
-    assert.ok(rows.every((row) => row.source === 'env-facts'))
-  } finally {
-    removeDir(temp)
-  }
+  // 复制时直接排除 log.jsonl：测试本身不删除文件。
+  cpSync(FIXTURES, temp, {
+    recursive: true,
+    filter: (source) => basename(source) !== 'log.jsonl',
+  })
+  const rows = collectCatalog(
+    {
+      sources: [
+        { id: 'env-facts', kind: 'facts', path: join(temp, 'facts.json') },
+        {
+          id: 'reading-log',
+          kind: 'jsonl',
+          path: join(temp, 'log.jsonl'),
+          idField: 'key',
+          titleField: 'title',
+          dateField: 'at',
+        },
+      ],
+    },
+    { now: FIXTURE_NOW },
+  )
+  assert.equal(rows.length, 3)
+  assert.ok(rows.every((row) => row.source === 'env-facts'))
 })
 
 test('T6 没配 sources：返回空字符串，日志明说未注入', () => {

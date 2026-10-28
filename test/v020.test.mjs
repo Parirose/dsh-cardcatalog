@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  cpSync, existsSync, mkdtempSync, readdirSync, rmdirSync, statSync, unlinkSync, utimesSync,
+  cpSync, existsSync, mkdtempSync, readdirSync, statSync, utimesSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -33,15 +33,6 @@ function markdownSource(extra = {}) {
 
 function factSource() {
   return { id: 'env-facts', kind: 'facts', path: join(FIXTURES, 'facts.json') }
-}
-
-function removeDir(dir) {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const target = join(dir, entry.name)
-    if (entry.isDirectory()) removeDir(target)
-    else unlinkSync(target)
-  }
-  rmdirSync(dir)
 }
 
 function fixtureStats(dir = FIXTURES) {
@@ -154,13 +145,12 @@ test('T12 nudge：未过期不注入；10 小时前注入且小时/最后一行�
     assert.ok(built.block.startsWith(NUDGE_OPEN))
     assert.equal(built.block.split('\n').length, 3)
   } finally {
-    removeDir(temp)
+    // 临时目录留给系统清理；测试本身不使用删除 API。
   }
 })
 
 test('T13 nudge 文件不存在：不注入、不建文件、日志一行', () => {
-  const file = join(NUDGE, 'not-there.md')
-  if (existsSync(file)) unlinkSync(file)
+  const file = join(NUDGE, `not-there-${process.pid}-${Date.now()}.md`)
   const messages = []
   const built = buildNudge({
     nudge: {

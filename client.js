@@ -46,6 +46,8 @@
           maxChars: 700,
           maxBytes: 4096,
           warnPct: 80,
+          allowRewrite: false,
+          archivePath: '~/.dsh/notes/archive/notes-{YYYY-MM}.md',
         },
       ], null, 2)
 
@@ -257,6 +259,7 @@
           var tone = base.tone || {}
           var wall = base.wall || {}
           var decay = base.decay || {}
+          var upkeep = base.upkeep || {}
           return {
             enabled: base.enabled !== false,
             sources: sources,
@@ -297,6 +300,10 @@
               importanceByScope: decay.importanceByScope && typeof decay.importanceByScope === 'object'
                 ? decay.importanceByScope
                 : {},
+            },
+            upkeep: {
+              enabled: upkeep.enabled === true,
+              keepPct: numberOr(upkeep.keepPct, 60),
             },
           }
         }
@@ -426,6 +433,10 @@
           : (decayDropped > 0
             ? ('今天已提示 ' + decayDropped + ' 条降档')
             : '今天没有降档')
+        var upkeep = draft.upkeep || {}
+        var upkeepState = state.upkeep || {}
+        var upkeepSources = Array.isArray(upkeepState.sources) ? upkeepState.sources : []
+        var snapshotDir = typeof upkeepState.snapshotDir === 'string' ? upkeepState.snapshotDir : ''
         var hasSources = (draft.sources || []).length > 0
 
         return h('div', { 'data-cc-page': '' },
@@ -494,6 +505,8 @@
               'markdown 源用 sections 或 tailLines 取正文，maxChars 是单源硬上限。',
               h('br'),
               'maxBytes 是每个源自己的体量红线（字节，0 = 不检查）；warnPct 默认 80。',
+              h('br'),
+              'allowRewrite: true 才会自动归档；archivePath 支持 {YYYY-MM}。',
               h('br'),
               '不配 sources ⇒ 目录什么都不注入。')),
 
@@ -732,7 +745,77 @@
               '红线是每个源自己的 maxBytes；warnPct 默认 80。容量条只读文件大小，不修改文件。')),
 
           h('div', { 'data-cc-sec': '' },
-            h('div', { 'data-cc-h': '' }, '裁剪与时机'),
+            h('div', { 'data-cc-h': '' }, '维护：受控归档'),
+            h('div', { 'data-cc-row': '' },
+              h('span', { 'data-cc-label': '' }, '启用归档改写'),
+              h(Switch, {
+                on: upkeep.enabled === true,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { upkeep: Object.assign({}, upkeep, { enabled: value }) }))
+                },
+              }),
+              h('span', { 'data-cc-note': '' }, '默认关闭；关闭时与 v0.6 行为一致')),
+            h('div', { 'data-cc-msg': '', 'data-warn': '' },
+              '开启后本插件会改写你的文件；归档前会先做快照。',
+              h('br'),
+              '只处理 allowRewrite: true 的 markdown 源；archivePath 为空就跳过。'),
+            h('div', { 'data-cc-grid': '' },
+              h(NumberField, {
+                label: 'keepPct',
+                value: upkeep.keepPct,
+                min: 10,
+                disabled: !writable,
+                onChange: function (value) {
+                  setDraft(Object.assign({}, draft, { upkeep: Object.assign({}, upkeep, { keepPct: Number(value) || 60 }) }))
+                },
+                note: '归档后保留到红线的这个百分比',
+              })),
+            h('div', { 'data-cc-kv': '' }, '快照目录：' + (snapshotDir || '（宿主未提供）')),
+            h('div', { 'data-cc-h': '' }, '每个源'),
+            upkeepSources.length
+              ? upkeepSources.map(function (item, index) {
+                var info = item.info || {}
+                var stateText = item.state === 'archived'
+                  ? '已归档'
+                  : (item.state === 'error'
+                    ? '失败'
+                    : (item.state === 'skipped' ? '跳过' : '未开启'))
+                var detail = ''
+                if (item.state === 'archived') {
+                  detail = '搬了 ' + (Number(info.moved) || 0) + ' 行，'
+                    + (Number(info.sizeBefore) || 0) + ' → ' + (Number(info.sizeAfter) || 0) + ' B'
+                    + (info.at ? ' · ' + fmtTime(info.at) : '')
+                  if (info.archivePath) detail += ' · ' + info.archivePath
+                } else if (item.state === 'error') {
+                  detail = '原因：' + (info.reason || 'unknown')
+                } else if (item.state === 'skipped') {
+                  var reasonText = info.reason === 'below-limit'
+                    ? '未超线'
+                    : (info.reason === 'missing-archive-path'
+                      ? '缺 archivePath'
+                      : (info.reason === 'not-allowed'
+                        ? '未允许改写'
+                        : (info.reason === 'no-limit'
+                          ? '未设 maxBytes'
+                          : (info.reason === 'no-entries'
+                            ? '没有可搬的条目'
+                            : (info.reason === 'cannot-reach-target'
+                              ? '文件头/指针已超过目标'
+                              : (info.reason || '未知原因'))))))
+                  detail = reasonText
+                } else {
+                  detail = 'allowRewrite 未开启，或源不是 markdown'
+                }
+                return h('div', { 'data-cc-src': '', key: item.id + ':' + index },
+                  h('div', { 'data-cc-row': '' },
+                    h('span', { 'data-cc-label': '' }, item.id || '(no-id)'),
+                    h('span', { 'data-cc-note': '' }, stateText)),
+                  h('div', { 'data-cc-kv': '' }, detail))
+              })
+              : h('div', { 'data-cc-note': '' }, '还没有源。')),
+        h('div', { 'data-cc-sec': '' },
+          h('div', { 'data-cc-h': '' }, '裁剪与时机'),
             h('div', { 'data-cc-grid': '' },
               h(NumberField, {
                 label: 'maxLines',

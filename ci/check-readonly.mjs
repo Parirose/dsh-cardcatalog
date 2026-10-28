@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 /**
- * 只读断言：源码里不允许出现对账本路径的写 API。
- *
- * 这里不判断“写的是哪条路径”——只要出现这些 API 就红。markdown / nudge 的实现
- * 也在同一扫描范围内；测试里删临时 fixture 用的是 unlinkSync，不在名单内。
+ * 可审计的白名单：
+ *   1. 写 API 只允许出现在 upkeep.mjs；其他任何 .js/.mjs（含测试）出现即红。
+ *   2. upkeep.mjs 必须同时包含 snapshot / verify / 原子替换，防止五步流程被简化。
+ *   3. 结果必须打印白名单说明。
  */
 import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const ALLOWED = 'upkeep.mjs'
 const SKIP_DIRS = new Set(['.git', 'node_modules', 'dist', '.dsh-market'])
 const CODE_EXT = /\.(?:js|mjs|cjs)$/
 
@@ -18,13 +19,14 @@ const NAMES = [
   'write' + 'File',
   'append' + 'File',
   'createWrite' + 'Stream',
-  'mk' + 'dir',
-  'r' + 'm',
   'ren' + 'ame',
   'copy' + 'File',
+  'un' + 'link',
+  'mk' + 'dir',
   'trun' + 'cate',
 ]
 const FORBIDDEN = new RegExp('\\b(?:' + NAMES.join('|') + ')(?:Sync)?\\b')
+const REQUIRED = ['snap' + 'shot', 'ver' + 'ify', 'rena' + 'meSync']
 
 function walk(dir, out) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -39,17 +41,31 @@ function walk(dir, out) {
 }
 
 const hits = []
+const allowedFile = join(ROOT, ALLOWED)
 for (const file of walk(ROOT, [])) {
   const rel = relative(ROOT, file).replaceAll('\\', '/')
+  if (file === allowedFile) continue
   const lines = readFileSync(file, 'utf8').split(/\r?\n/)
   for (let index = 0; index < lines.length; index += 1) {
     if (FORBIDDEN.test(lines[index])) hits.push({ rel, line: index + 1 })
   }
 }
 
-if (hits.length > 0) {
+let allowedText = ''
+try {
+  allowedText = readFileSync(allowedFile, 'utf8')
+} catch {
+  // 下面统一报错。
+}
+const missing = REQUIRED.filter((word) => !allowedText.includes(word))
+
+if (hits.length > 0 || missing.length > 0) {
   for (const hit of hits) console.error(`FAIL ${hit.rel}:${hit.line} read-only violation`)
-  console.error(`check:readonly: ${hits.length} 处命中`)
+  if (missing.length > 0) {
+    console.error(`FAIL ${ALLOWED} 缺必要步骤：${missing.join(', ')}`)
+  }
+  const count = hits.length + (missing.length > 0 ? 1 : 0)
+  console.error(`check:readonly: ${count} 处越界（白名单：${ALLOWED}）`)
   process.exit(1)
 }
-console.log('check:readonly: 0 处命中')
+console.log(`check:readonly: 0 处越界（白名单：${ALLOWED}）`)

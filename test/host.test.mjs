@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { cpSync, mkdtempSync, readdirSync, rmdirSync, unlinkSync, utimesSync } from 'node:fs'
+import { cpSync, mkdtempSync, utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -179,18 +179,8 @@ test('没有 schemastery 时从家目录 config.json 读配置', { skip: Boolean
   } finally {
     if (previous === undefined) delete process.env.CARDCATALOG_TEST_FACTS
     else process.env.CARDCATALOG_TEST_FACTS = previous
-    removeDir(home)
   }
 })
-
-function removeDir(dir) {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const target = join(dir, entry.name)
-    if (entry.isDirectory()) removeDir(target)
-    else unlinkSync(target)
-  }
-  rmdirSync(dir)
-}
 
 test('设置页接口：没配 sources 也能读状态；保存只走 settings.update', async () => {
   const routes = []
@@ -293,6 +283,11 @@ test('设置页接口：来源状态卡四态、onboarding 与可复制片段', 
   assert.equal(payload.redline.length, 4)
   assert.deepEqual(payload.redline.map((item) => item.state), ['off', 'off', 'off', 'off'])
   assert.ok(payload.redline.every((item) => 'id' in item && 'bytes' in item && 'pct' in item && 'maxBytes' in item))
+  assert.equal(payload.upkeep.enabled, false)
+  assert.equal(payload.upkeep.keepPct, 60)
+  assert.ok(payload.upkeep.snapshotDir.includes('cardcatalog'))
+  assert.equal(payload.upkeep.sources.length, 4)
+  assert.deepEqual(payload.upkeep.sources.map((item) => item.state), ['off', 'off', 'off', 'off'])
 })
 
 test('设置页接口：先有系统提示、后开 nudge 时补挂消息接缝', async () => {
@@ -372,7 +367,7 @@ test('宿主注入：nudge 在系统提示接缝旁单独走消息，且默认�
     const second = await runPreStep(handlers.get('agent/pre-step'), agent, 2)
     assert.equal(second.messages.length, 0)
   } finally {
-    removeDir(temp)
+    // 临时目录留给系统清理；测试本身不使用删除 API。
   }
 })
 
@@ -404,7 +399,7 @@ test('宿主注入：nudge 与目录可合并为一条消息，目录去重仍�
     const second = await runPreStep(handlers.get('agent/pre-step'), agent, 2)
     assert.equal(second.messages.length, 0)
   } finally {
-    removeDir(temp)
+    // 临时目录留给系统清理；测试本身不使用删除 API。
   }
 })
 

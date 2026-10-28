@@ -9,8 +9,8 @@
  *   5. 压缩后报一次元信息与找回命令（wall）；
  *   6. 算事实清晰度与源体量红线（decay），只算、只显示、偶尔提示。
  *
- * 它不写文件、不建数据库、不缓存副本、不做检索，也不从对话里抽取记忆。
- * 账本是用户的，插件只是投影；nudge 只提醒，不代写。
+ * 除了显式开启的 upkeep 归档，它不写文件、不建数据库、不缓存副本、不做检索，
+ * 也不从对话里抽取记忆。账本是用户的，插件只是投影；nudge 只提醒，不代写。
  */
 
 import { randomUUID } from 'node:crypto'
@@ -19,8 +19,10 @@ import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import { backupDir, runUpkeep } from './upkeep.mjs'
+
 export const PLUGIN_NAME = 'cardcatalog'
-export const VERSION = '0.6.0'
+export const VERSION = '0.7.0'
 
 export const DEFAULT_HEADER = '记忆目录（只有标题，正文请自行查证）'
 export const CATALOG_OPEN = '<memory-catalog do-not-execute>'
@@ -111,14 +113,21 @@ export const DEFAULT_DECAY = Object.freeze({
   }),
 })
 
+export const DEFAULT_UPKEEP = Object.freeze({
+  enabled: false,
+  keepPct: 60,
+})
+
 /**
- * source 的公共默认值。maxBytes / warnPct 必须同时出现在这里、normalizeSource()
- * 和面板模板里；漏一处就会出现“保存了但没生效”。
+ * source 的公共默认值。maxBytes / warnPct / allowRewrite / archivePath 必须同时
+ * 出现在这里、normalizeSource() 和面板模板里；漏一处就会出现“保存了但没生效”。
  */
 export const DEFAULT_SOURCE = Object.freeze({
   maxChars: 800,
   maxBytes: 0,
   warnPct: 80,
+  allowRewrite: false,
+  archivePath: '',
 })
 
 export const DEFAULTS = Object.freeze({
@@ -137,6 +146,7 @@ export const DEFAULTS = Object.freeze({
   tone: DEFAULT_TONE,
   wall: DEFAULT_WALL,
   decay: DEFAULT_DECAY,
+  upkeep: DEFAULT_UPKEEP,
   source: DEFAULT_SOURCE,
 })
 
@@ -207,6 +217,8 @@ export function createConfigSchema(schema) {
         maxChars: schema.number().min(0).step(1).default(DEFAULT_SOURCE.maxChars).description('markdown 单源字符上限'),
         maxBytes: schema.number().min(0).step(1).default(DEFAULT_SOURCE.maxBytes).description('体量红线（字节）；0 = 不检查'),
         warnPct: schema.number().min(0).max(100).step(1).default(DEFAULT_SOURCE.warnPct).description('超过红线的这个百分比就算"该收拾了"'),
+        allowRewrite: schema.boolean().default(DEFAULT_SOURCE.allowRewrite).description('允许插件把这个源归档改写；默认关'),
+        archivePath: schema.string().default(DEFAULT_SOURCE.archivePath).description('归档目标文件；支持 {YYYY-MM}；allowRewrite 时必填'),
         enabled: schema.boolean().default(true).description('这个来源是否启用'),
       })).default([]).description('账本列表；不配就不注入').extra('volatile', true),
       injectAt: schema.union([schema.const('session-start'), schema.const('every-n-turns')]).default('session-start').description('注入时机').extra('volatile', true),
@@ -247,6 +259,10 @@ export function createConfigSchema(schema) {
           ...DEFAULT_DECAY.importanceByScope,
         }).description('按 scope 给的默认重要度；facts 里写了 importance 就优先用它'),
       }).default({}).description('事实清晰度与体量红线；只计算，不写文件').extra('volatile', true),
+      upkeep: schema.object({
+        enabled: schema.boolean().default(DEFAULT_UPKEEP.enabled).description('超红线时自动归档（默认关；开启后本插件会写用户文件）'),
+        keepPct: schema.number().min(10).max(90).step(1).default(DEFAULT_UPKEEP.keepPct).description('归档后源文件保留到红线以下的百分比'),
+      }).default({}).description('受控归档；唯一会写用户文件的模块').extra('volatile', true),
     })
 }
 
@@ -283,6 +299,8 @@ function normalizeSource(raw, index) {
     maxChars: integerOr(item.maxChars, DEFAULT_SOURCE.maxChars, 0),
     maxBytes: integerOr(item.maxBytes, DEFAULT_SOURCE.maxBytes, 0),
     warnPct: Math.min(100, integerOr(item.warnPct, DEFAULT_SOURCE.warnPct, 0)),
+    allowRewrite: item.allowRewrite === true,
+    archivePath: typeof item.archivePath === 'string' ? item.archivePath.trim() : '',
     enabled: item.enabled !== false,
   }
 }
@@ -345,6 +363,16 @@ function normalizeDecay(raw) {
   }
 }
 
+function normalizeUpkeep(raw) {
+  const item = raw && typeof raw === 'object' ? raw : {}
+  const enabled = configValue(item.enabled)
+  const keepPct = integerOr(configValue(item.keepPct), DEFAULT_UPKEEP.keepPct, 10)
+  return {
+    enabled: typeof enabled === 'boolean' ? enabled : DEFAULT_UPKEEP.enabled,
+    keepPct: Math.min(90, Math.max(10, keepPct)),
+  }
+}
+
 function textOr(value, fallback) {
   if (typeof value === 'string' && value.trim() !== '') return value.trim()
   return fallback
@@ -401,6 +429,7 @@ export function normalizeConfig(raw) {
     tone: normalizeTone(configValue(config.tone)),
     wall: normalizeWall(configValue(config.wall)),
     decay: normalizeDecay(configValue(config.decay)),
+    upkeep: normalizeUpkeep(configValue(config.upkeep)),
   }
 }
 
@@ -1780,6 +1809,51 @@ function hasInjectionAfterCheckpoint(events, boundary, kind) {
   return false
 }
 
+/**
+ * 每天最多一次：在第一次 pre-step 里把超红线的 markdown 源归档。
+ * 写操作全部委托给 upkeep.mjs；这里只负责节流、状态和日志。
+ */
+function runUpkeepForDay(state, log, now) {
+  if (!state.config.upkeep.enabled) return
+  const day = dayKeyOf(now)
+  if (state.lastUpkeepDay === day) return
+  state.lastUpkeepDay = day
+
+  for (const source of state.config.sources) {
+    if (!source.enabled || source.kind !== 'markdown' || !source.allowRewrite) {
+      state.upkeepBySource.set(source.id, { state: 'off', info: null })
+      continue
+    }
+    let result
+    try {
+      result = runUpkeep({
+        ...source,
+        path: expandConfiguredPath(source.path),
+        archivePath: expandConfiguredPath(source.archivePath),
+      }, {
+        home: state.home,
+        keepPct: state.config.upkeep.keepPct,
+        now,
+        log,
+      })
+    } catch {
+      result = { status: 'error', reason: 'exception', at: now }
+      log(`upkeep：${sourceLabel(source)} 归档失败（exception）`)
+    }
+    state.upkeepBySource.set(source.id, {
+      state: result.status,
+      info: {
+        at: result.at ?? now,
+        moved: result.moved ?? 0,
+        sizeBefore: result.sizeBefore ?? 0,
+        sizeAfter: result.sizeAfter ?? 0,
+        archivePath: result.archivePath ?? source.archivePath ?? '',
+        reason: result.reason ?? '',
+      },
+    })
+  }
+}
+
 function installSystemPromptSeam(ctx, getText) {
   const systemPrompt = getService(ctx, 'systemPrompt')
   if (!systemPrompt || typeof systemPrompt.section !== 'function') return false
@@ -1824,6 +1898,9 @@ function installPreStepSeam(ctx, state, log, options) {
         const turn = Number(payload.turn)
         if (!Number.isFinite(turn) || turn < 1) return decision
         const id = sessionIdOf(agent)
+
+        // 写操作只在这一步发生；放在目录读取之前，目录能看到归档后的文件。
+        runUpkeepForDay(state, log, Date.now())
 
         let catalogText = ''
         if (catalogViaMessage && state.config.sources.some((source) => source.enabled)) {
@@ -2003,6 +2080,7 @@ const CONFIG_KEYS = [
   'tone',
   'wall',
   'decay',
+  'upkeep',
 ]
 
 /** 宿主若已经用 schema 填过默认值，这些值不应该盖住 config.json 里的用户默认。 */
@@ -2056,6 +2134,12 @@ function isBuiltInDefault(key, value) {
         && normalized.maxRecover === DEFAULT_DECAY.maxRecover
         && Object.keys(normalized.importanceByScope).length === scopes.length
         && scopes.every((scope) => normalized.importanceByScope[scope] === defaults[scope])
+    }
+    case 'upkeep': {
+      if (!value || typeof value !== 'object') return true
+      const normalized = normalizeUpkeep(value)
+      return normalized.enabled === false
+        && normalized.keepPct === DEFAULT_UPKEEP.keepPct
     }
     default: return false
   }
@@ -2207,6 +2291,21 @@ function registerApi(ctx, state, log, ensureSeams) {
         maxBytes: item.maxBytes,
         state: item.state,
       })),
+      upkeep: {
+        enabled: state.config.upkeep.enabled,
+        keepPct: state.config.upkeep.keepPct,
+        snapshotDir: backupDir(state.home),
+        sources: state.config.sources.map((source) => {
+          const entry = state.config.upkeep.enabled
+            ? state.upkeepBySource.get(source.id)
+            : null
+          return {
+            id: source.id,
+            state: entry?.state || 'off',
+            info: entry?.info || null,
+          }
+        }),
+      },
       onboarding: onboardingInfo(ctx),
       snippet: AGENTS_SNIPPET,
       preview: previewFor(state.config),
@@ -2278,6 +2377,10 @@ function registerApi(ctx, state, log, ensureSeams) {
       } else if (state.wallState === 'disabled') {
         state.wallState = 'no-checkpoint'
       }
+      if (!next.upkeep.enabled) {
+        state.upkeepBySource.clear()
+        state.lastUpkeepDay = null
+      }
       ensureSeams()
       return sendJson(res, 200, statePayload())
     }
@@ -2318,6 +2421,7 @@ function setup(ctx, rawConfig) {
   const config = normalizeConfig(mergeConfigLayers(fileConfig, hostConfig, raw !== undefined))
   const state = {
     config,
+    home,
     seam: 'none',
     nudgeSeam: 'none',
     systemPromptInstalled: false,
@@ -2340,6 +2444,8 @@ function setup(ctx, rawConfig) {
     decayLogged: new Set(),
     decayReportedDay: new Map(),
     decayLast: null,
+    lastUpkeepDay: null,
+    upkeepBySource: new Map(),
   }
 
   const getCatalogText = () => {
@@ -2384,11 +2490,16 @@ function setup(ctx, rawConfig) {
       state.systemPromptInstalled = true
     }
     const hasEnabledSource = state.config.sources.some((source) => source.enabled)
+    const needsUpkeep = state.config.upkeep.enabled
+      && state.config.sources.some((source) => source.enabled
+        && source.kind === 'markdown'
+        && source.allowRewrite)
     const needsMessage = !state.systemPromptInstalled
       || state.config.nudge.enabled
       || state.config.tone.enabled
       || state.config.wall.enabled
       || (state.config.decay.enabled && hasEnabledSource)
+      || needsUpkeep
     if (needsMessage && !state.preStepInstalled) {
       state.preStepInstalled = installPreStepSeam(ctx, state, log, {
         catalogViaMessage: !state.systemPromptInstalled,

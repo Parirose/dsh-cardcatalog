@@ -16,6 +16,7 @@ jobs:
         run: |
           node --check index.js
           node --check client.js
+          node --check upkeep.mjs
       - name: Tests
         run: npm test
       - name: Privacy
