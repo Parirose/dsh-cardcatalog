@@ -118,6 +118,16 @@ export const DEFAULT_UPKEEP = Object.freeze({
   keepPct: 60,
 })
 
+/** 派生视图导出的默认值：全空、默认关；路径必须由用户填。 */
+export const DEFAULT_VIEW = Object.freeze({
+  enabled: false,
+  dir: '',
+  title: '记忆卡（派生视图）',
+  rebuild: '',
+  bodyLimit: 320,
+  chapters: Object.freeze([]),
+})
+
 /**
  * source 的公共默认值。maxBytes / warnPct / allowRewrite / archivePath 必须同时
  * 出现在这里、normalizeSource() 和面板模板里；漏一处就会出现“保存了但没生效”。
@@ -147,6 +157,7 @@ export const DEFAULTS = Object.freeze({
   wall: DEFAULT_WALL,
   decay: DEFAULT_DECAY,
   upkeep: DEFAULT_UPKEEP,
+  view: DEFAULT_VIEW,
   source: DEFAULT_SOURCE,
 })
 
@@ -263,6 +274,17 @@ export function createConfigSchema(schema) {
         enabled: schema.boolean().default(DEFAULT_UPKEEP.enabled).description('超红线时自动归档（默认关；开启后本插件会写用户文件）'),
         keepPct: schema.number().min(10).max(90).step(1).default(DEFAULT_UPKEEP.keepPct).description('归档后源文件保留到红线以下的百分比'),
       }).default({}).description('受控归档；唯一会写用户文件的模块').extra('volatile', true),
+      view: schema.object({
+        enabled: schema.boolean().default(DEFAULT_VIEW.enabled).description('导出派生视图（默认关；开启后由显式动作触发写盘）'),
+        dir: schema.string().default(DEFAULT_VIEW.dir).description('派生目录；留空表示不导出。代码里没有默认路径'),
+        title: schema.string().default(DEFAULT_VIEW.title).description('派生文件的一级标题'),
+        rebuild: schema.string().default(DEFAULT_VIEW.rebuild).description('写进头部的重建命令（给人看）'),
+        bodyLimit: schema.number().min(40).max(2000).step(1).default(DEFAULT_VIEW.bodyLimit).description('每条正文最多多少字'),
+        chapters: schema.array(schema.object({
+          title: schema.string().default(''),
+          match: schema.string().default('').description('对 source id 的正则；留空表示落到最后一章'),
+        })).default([]).description('章名 → 取哪些 source；留空用内置的中性分章'),
+      }).default({}).description('派生视图导出；只写派生目录，不碰源文件').extra('volatile', true),
     })
 }
 
@@ -363,6 +385,24 @@ function normalizeDecay(raw) {
   }
 }
 
+function normalizeView(raw) {
+  const item = raw && typeof raw === 'object' ? raw : {}
+  const chapters = Array.isArray(item.chapters)
+    ? item.chapters
+      .filter((c) => c && typeof c === 'object')
+      .map((c) => ({ title: textOr(c.title, '未命名'), match: typeof c.match === 'string' ? c.match : '' }))
+      .filter((c) => c.title)
+    : []
+  return {
+    enabled: item.enabled === true,
+    dir: typeof item.dir === 'string' ? item.dir.trim() : '',
+    title: textOr(item.title, DEFAULT_VIEW.title),
+    rebuild: typeof item.rebuild === 'string' ? item.rebuild.trim() : '',
+    bodyLimit: integerOr(item.bodyLimit, DEFAULT_VIEW.bodyLimit, 40),
+    chapters,
+  }
+}
+
 function normalizeUpkeep(raw) {
   const item = raw && typeof raw === 'object' ? raw : {}
   const enabled = configValue(item.enabled)
@@ -430,6 +470,7 @@ export function normalizeConfig(raw) {
     wall: normalizeWall(configValue(config.wall)),
     decay: normalizeDecay(configValue(config.decay)),
     upkeep: normalizeUpkeep(configValue(config.upkeep)),
+    view: normalizeView(configValue(config.view)),
   }
 }
 
@@ -2567,4 +2608,114 @@ export function apply(ctx, rawConfig) {
       // 初始化失败也不向宿主抛。
     }
   }
+}
+
+
+// ═══════════════════════════════════════════════════════
+// 视图导出（v0.8）：把目录投成「人能读、可视化工具也能读」的派生档案
+//
+// 纪律：
+//   · 纯函数，不写盘（写盘一律交给 upkeep.writeDerivedView）
+//   · 只输出**派生物**，头部写死「勿手改 / 重建命令 / 源头指纹」
+//   · 章节名和路径全部来自配置，代码里不出现任何具体路径或人名
+// ═══════════════════════════════════════════════════════
+
+export const DEFAULT_VIEW_CHAPTERS = Object.freeze([
+  { title: '身份', match: '^(?:persona|identity|self|who)' },
+  { title: '关系', match: '^(?:user|owner|relation|rapport)' },
+  { title: '环境', match: '^(?:env|machine|host|port|path|net|tunnel|drive)' },
+  { title: '工具', match: '(?:tool|skill|model|workflow|prompt)' },
+  { title: '坑', match: '(?:fail|bug|fix|trap|pitfall|warn)' },
+])
+
+function viewMeta(item, source) {
+  const bits = []
+  const when = typeof item?.[source.verifiedField || 'verifiedAt'] === 'string'
+    ? item[source.verifiedField || 'verifiedAt']
+    : ''
+  if (when) bits.push(`验证于 ${when}`)
+  const why = typeof item?.[source.sourceField || 'source'] === 'string'
+    ? item[source.sourceField || 'source']
+    : ''
+  if (why) bits.push(`出处：${why.slice(0, 120)}`)
+  return bits.join(' · ')
+}
+
+/**
+ * 从配置读出来、按章分好组的条目。**只读源文件，不写任何东西。**
+ *
+ * @param {unknown} rawConfig
+ * @param {{ now?: number, log?: (message: string) => void }} [options]
+ * @returns {Array<{chapter: string, title: string, body: string, meta: string}>}
+ */
+export function collectViewEntries(rawConfig, options = {}) {
+  const config = normalizeConfig(rawConfig)
+  const log = options.log
+  const view = config.view && config.view.enabled ? config.view : null
+  if (!view) return []
+  const chapters = Array.isArray(view.chapters) && view.chapters.length
+    ? view.chapters.map((c) => ({ title: String(c.title || '未命名'), match: String(c.match || '') }))
+    : DEFAULT_VIEW_CHAPTERS.map((c) => ({ ...c }))
+  const bodyLimit = Number.isFinite(view.bodyLimit) ? view.bodyLimit : 320
+  const out = []
+  for (const source of config.sources) {
+    if (!source.enabled) continue
+    let items
+    try {
+      if (source.kind === 'markdown') continue
+      items = parseItems(source, readSourceText(source))
+    } catch (error) {
+      safeLog(log, `view：source ${source.id} 跳过（${reasonOf(error)}）`)
+      continue
+    }
+    for (const item of items) {
+      if (!item || typeof item !== 'object') continue
+      const id = String(item[source.idField] ?? '')
+      const title = sanitizeTitle(item[source.titleField], id) || id || '未命名'
+      const body = String(item[source.textField || 'text'] ?? item[source.titleField] ?? '').replace(/\s+/g, ' ').slice(0, bodyLimit)
+      let chapter = chapters[chapters.length - 1]?.title || '其它'
+      for (const c of chapters) {
+        if (c.match && new RegExp(c.match, 'i').test(source.id)) { chapter = c.title; break }
+      }
+      out.push({ chapter, title: String(title), body, meta: viewMeta(item, source) })
+    }
+  }
+  return out
+}
+
+/**
+ * 渲染成 markdown。纯函数：同样的 entries + options → 同样的文本（时间戳与指纹由调用方给）。
+ *
+ * @param {Array<{chapter: string, title: string, body: string, meta: string}>} entries
+ * @param {{ title?: string, rebuild?: string, stamp?: string, fingerprint?: string }} [options]
+ * @returns {string}
+ */
+export function renderMemoryCard(entries, options = {}) {
+  const title = String(options.title || '记忆卡（派生视图）')
+  const rebuild = String(options.rebuild || '')
+  const stamp = String(options.stamp || '')
+  const fingerprint = String(options.fingerprint || '')
+  const lines = [`# ${title}`, '']
+  lines.push('> **这是派生物，不要手改。**' + (rebuild ? ` 重建：\`${rebuild}\`` : ''))
+  if (stamp || fingerprint) {
+    lines.push(`> ${[stamp ? `生成时间 ${stamp}` : '', fingerprint ? `源头指纹 ${fingerprint}` : ''].filter(Boolean).join(' · ')}`)
+  }
+  lines.push('')
+  const order = []
+  const groups = new Map()
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const chapter = String(entry?.chapter || '其它')
+    if (!groups.has(chapter)) { groups.set(chapter, []); order.push(chapter) }
+    groups.get(chapter).push(entry)
+  }
+  for (const chapter of order) {
+    lines.push(`## ${chapter}`, '')
+    for (const entry of groups.get(chapter)) {
+      lines.push(`### ${String(entry.title || '未命名')}`)
+      if (entry.body) lines.push(String(entry.body))
+      if (entry.meta) lines.push(String(entry.meta))
+      lines.push('')
+    }
+  }
+  return `${lines.join('\n').replace(/\n+$/, '')}\n`
 }

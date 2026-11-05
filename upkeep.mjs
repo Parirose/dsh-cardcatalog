@@ -20,7 +20,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { basename, dirname, extname, join, resolve } from 'node:path'
+import { basename, dirname, extname, join, resolve, sep } from 'node:path'
 
 const POINTER_RE = /^> 更早的 \d+ 条已归档到/
 
@@ -77,6 +77,60 @@ function pointerLine(count, archivePath, now) {
 
 export function backupDir(home) {
   return join(home, 'cardcatalog', 'backups')
+}
+
+/**
+ * 把一组「派生文件」整份写到指定目录（视图导出用）。
+ *
+ * 与 runUpkeep 的区别：runUpkeep 动的是**用户的源文件**（要快照、要核对、要回滚）；
+ * 这里动的是**派生物**——丢了能重建，所以只保证「要么全写成功、要么留旧的」。
+ *
+ * 三条纪律：
+ *   1. 只写 files 里点名的相对路径；目录里别的东西一律不碰（不删、不改名）
+ *   2. 每个文件先写 `<name>.tmp` 再 rename，避免半截文件被读走
+ *   3. 拒绝绝对路径和 `..`，防止配置把它带到派生目录外面
+ *
+ * @param {string} dir 派生目录
+ * @param {Record<string, string>} files 相对路径 → 文本
+ * @param {{ log?: (message: string) => void }} [options]
+ * @returns {{status: 'written'|'skipped'|'error', reason?: string, written?: string[], bytes?: number}}
+ */
+export function writeDerivedView(dir, files, options = {}) {
+  const log = options.log
+  if (typeof dir !== 'string' || dir.trim() === '') {
+    safeLog(log, 'view：没配派生目录，跳过')
+    return { status: 'skipped', reason: 'missing-dir' }
+  }
+  if (!files || typeof files !== 'object') return { status: 'skipped', reason: 'no-files' }
+  const root = resolve(dir)
+  const written = []
+  let bytes = 0
+  try {
+    for (const [rel, text] of Object.entries(files)) {
+      if (typeof rel !== 'string' || typeof text !== 'string') {
+        return { status: 'error', reason: 'bad-entry' }
+      }
+      const normalized = rel.replaceAll('\\', '/')
+      if (normalized.startsWith('/') || /^[A-Za-z]:/.test(normalized) || normalized.split('/').includes('..')) {
+        return { status: 'error', reason: 'unsafe-path' }
+      }
+      const target = resolve(root, normalized)
+      if (target !== root && !target.startsWith(root + sep)) {
+        return { status: 'error', reason: 'escaped-dir' }
+      }
+      mkdirSync(dirname(target), { recursive: true })
+      const tmp = `${target}.tmp`
+      writeAndSync(tmp, text)
+      renameSync(tmp, target)
+      written.push(normalized)
+      bytes += Buffer.byteLength(text, 'utf8')
+    }
+  } catch {
+    safeLog(log, 'view：写派生文件失败')
+    return { status: 'error', reason: 'write-failed' }
+  }
+  safeLog(log, `view：写了 ${written.length} 个派生文件（${bytes} B）到 ${root}`)
+  return { status: 'written', written, bytes }
 }
 
 /** 把 {YYYY-MM} 换成本地月份；不做别的路径猜测。 */
