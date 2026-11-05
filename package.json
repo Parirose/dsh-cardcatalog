@@ -18,7 +18,8 @@
     "README.md",
     "docs",
     "fixtures",
-    "LICENSE"
+    "LICENSE",
+    "tools/export-view.mjs"
   ],
   "engines": {
     "node": ">=22.19.0",
